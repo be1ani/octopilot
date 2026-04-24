@@ -1,0 +1,120 @@
+.toast-host {
+  position: fixed;
+  top: 0.9rem;
+  right: 0.9rem;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  width: min(360px, calc(100vw - 1.8rem));
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  background: rgba(19, 28, 49, 0.92);
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 12px;
+  padding: 0.7rem 0.75rem;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(10px);
+}
+
+.toast--good {
+  border-left-color: var(--success);
+}
+.toast--warn {
+  border-left-color: var(--warning);
+}
+.toast--bad {
+  border-left-color: var(--danger);
+}
+.toast--neutral {
+  border-left-color: rgba(148, 163, 184, 0.4);
+}
+
+.toast--urgent {
+  border-left-color: var(--danger);
+  border-color: rgba(248, 113, 113, 0.55);
+  background: rgba(60, 18, 22, 0.92);
+  box-shadow: 0 22px 55px rgba(0, 0, 0, 0.55);
+  animation: urgentPulse 1.25s ease-in-out infinite;
+}
+
+.toast--urgent-ack {
+  animation: none;
+  opacity: 0.95;
+}
+
+.toast--urgent .toast-title {
+  color: #ffe4e6;
+}
+
+.toast-hint {
+  margin-top: 0.35rem;
+  font-size: 0.72rem;
+  opacity: 0.9;
+}
+
+@keyframes urgentPulse {
+  0% {
+    transform: translateY(0);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.52);
+  }
+  50% {
+    transform: translateY(-1px);
+    box-shadow: 0 26px 62px rgba(0, 0, 0, 0.58);
+  }
+  100% {
+    transform: translateY(0);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.52);
+  }
+}
+
+.toast-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.25rem;
+}
+
+.toast-title {
+  font-weight: 650;
+  letter-spacing: 0.2px;
+}
+
+.toast-x {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.toast-x:hover {
+  color: var(--text);
+  border-color: rgba(148, 163, 184, 0.25);
+}
+
+.toast-body {
+  color: var(--text);
+}
+
+.toast-actions {
+  margin-top: 0.45rem;
+}
+
+.toast-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.toast-link:hover {
+  text-decoration: underline;
+}
+

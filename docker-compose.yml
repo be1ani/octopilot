@@ -1,0 +1,61 @@
+services:
+  master-database:
+    image: mongo:7
+    container_name: octopilot-master-database
+    restart: unless-stopped
+    volumes:
+      - master_database_data:/data/db
+    ports:
+      - "27017:27017"
+
+  orchestrator-backend:
+    build:
+      context: .
+      dockerfile: orchestrator/backend/Dockerfile
+    image: octopilot-orchestrator-backend:latest
+    container_name: octopilot-orchestrator-backend
+    restart: unless-stopped
+    environment:
+      ORCH_PORT: "5050"
+      ORCH_PUBLIC_HOST: "127.0.0.1"
+      # Profiles persistence (MongoDB)
+      ORCH_MONGO_URI: "mongodb://master-database:27017"
+      ORCH_MONGO_DB_NAME: "orchestrator_db"
+      # Absolute host path to this repo (used for docker bind-mounts)
+      ORCH_HOST_REPO_ROOT: "/home/oligarch/Projects/octopilot"
+      # Use the host docker CLI mounted below
+      ORCH_DOCKER_BIN: "/host-bin/docker"
+      # External source API the orchestrator polls for queued work.
+      # Leave blank to disable queue polling until configured at runtime.
+      SOURCE_API: ""
+      # Default parallel-machine limit; live-editable from the UI.
+      ORCH_MAX_PARALLEL_MACHINES: "4"
+    depends_on:
+      - master-database
+    volumes:
+      - ./orchestrator/data:/repo/orchestrator/data
+      - ./attachments:/repo/attachments
+      # Optional: allow orchestrator to pass host env to agent containers if present
+      - ./.env:/repo/.env:ro
+      # Allow orchestrator to control host Docker daemon
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Provide docker CLI inside container (no in-image install needed)
+      - /usr/bin/docker:/host-bin/docker:ro
+    ports:
+      - "5050:5050"
+
+  orchestrator-frontend:
+    build:
+      context: .
+      dockerfile: orchestrator/frontend/Dockerfile
+    image: octopilot-orchestrator-frontend:latest
+    container_name: octopilot-orchestrator-frontend
+    restart: unless-stopped
+    depends_on:
+      - orchestrator-backend
+    ports:
+      - "5080:8080"
+
+volumes:
+  master_database_data:
+

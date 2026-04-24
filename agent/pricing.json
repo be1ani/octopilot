@@ -1,0 +1,39 @@
+{
+  "_notes": [
+    "USD per 1,000,000 tokens. Optional keys: usd_per_1m_cached_input, usd_per_1m_audio_input, usd_per_1m_audio_output.",
+    "Keep `last_updated` current; llm_usage.py warns when the file goes stale (AGENT_LLM_PRICING_MAX_AGE_DAYS).",
+    "Point to this file via AGENT_LLM_PRICING_FILE. Values here OVERRIDE the defaults baked into llm_usage.py.",
+    "gpt-5.4* entries are provisional placeholders; update with the official numbers from platform.openai.com/docs/pricing when available."
+  ],
+  "last_updated": "2026-04-19",
+  "source": "https://platform.openai.com/docs/pricing",
+  "models": {
+    "gpt-4.1":       {"usd_per_1m_input": 2.00, "usd_per_1m_output": 8.00,  "usd_per_1m_cached_input": 0.50},
+    "gpt-4.1-mini":  {"usd_per_1m_input": 0.40, "usd_per_1m_output": 1.60,  "usd_per_1m_cached_input": 0.10},
+    "gpt-4.1-nano":  {"usd_per_1m_input": 0.10, "usd_per_1m_output": 0.40,  "usd_per_1m_cached_input": 0.025},
+
+    "gpt-5.4":       {"usd_per_1m_input": 2.50, "usd_per_1m_output": 10.00, "usd_per_1m_cached_input": 0.625},
+    "gpt-5.4-mini":  {"usd_per_1m_input": 0.50, "usd_per_1m_output": 2.00,  "usd_per_1m_cached_input": 0.125},
+    "gpt-5.4-nano":  {"usd_per_1m_input": 0.12, "usd_per_1m_output": 0.50,  "usd_per_1m_cached_input": 0.030},
+
+    "gpt-4o":        {"usd_per_1m_input": 2.50, "usd_per_1m_output": 10.00, "usd_per_1m_cached_input": 1.25},
+    "gpt-4o-mini":   {"usd_per_1m_input": 0.15, "usd_per_1m_output": 0.60,  "usd_per_1m_cached_input": 0.075},
+
+    "o1":            {"usd_per_1m_input": 15.00,"usd_per_1m_output": 60.00, "usd_per_1m_cached_input": 7.50},
+    "o1-mini":       {"usd_per_1m_input": 1.10, "usd_per_1m_output": 4.40,  "usd_per_1m_cached_input": 0.55},
+    "o3":            {"usd_per_1m_input": 2.00, "usd_per_1m_output": 8.00,  "usd_per_1m_cached_input": 0.50},
+    "o3-mini":       {"usd_per_1m_input": 1.10, "usd_per_1m_output": 4.40,  "usd_per_1m_cached_input": 0.55},
+    "o4-mini":       {"usd_per_1m_input": 1.10, "usd_per_1m_output": 4.40,  "usd_per_1m_cached_input": 0.275},
+
+    "text-embedding-3-small": {"usd_per_1m_input": 0.02, "usd_per_1m_output": 0.0},
+    "text-embedding-3-large": {"usd_per_1m_input": 0.13, "usd_per_1m_output": 0.0},
+    "text-embedding-ada-002": {"usd_per_1m_input": 0.10, "usd_per_1m_output": 0.0},
+
+    "claude-opus-4-6":     {"usd_per_1m_input": 5.00, "usd_per_1m_output": 25.00},
+    "claude-opus-4-5":     {"usd_per_1m_input": 5.00, "usd_per_1m_output": 25.00},
+    "gemini-flash-latest": {"usd_per_1m_input": 0.10, "usd_per_1m_output": 0.40},
+
+    "bu-2-0": {"usd_per_1m_input": 0.60, "usd_per_1m_output": 3.50},
+    "bu-1-0": {"usd_per_1m_input": 0.20, "usd_per_1m_output": 2.00}
+  }
+}

@@ -1,0 +1,12 @@
+requests>=2.31.0
+pymongo>=4.8.0
+pydantic>=2.7.0
+pypdf>=5.0.0
+openai>=1.40.0
+email-validator>=2.0.0
+fpdf2>=2.7.0
+
+# Browser automation agent (Playwright-based)
+browser-use>=0.12.6
+playwright>=1.45.0
+

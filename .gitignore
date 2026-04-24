@@ -1,0 +1,4 @@
+agent/__pycache__
+orchestrator/backend/__pycache__
+profiles/__pycache__
+*.env

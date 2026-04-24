@@ -1,0 +1,194 @@
+{
+  "schema_version": "1.0",
+  "fields": {
+    "base.full_name": {
+      "key": "base.full_name",
+      "label": "Full name",
+      "category": "absolute",
+      "description": "Applicant's legal or preferred full name (as it should appear on the application).",
+      "unrecognized": false
+    },
+    "base.email": {
+      "key": "base.email",
+      "label": "Email",
+      "category": "absolute",
+      "description": "Primary email address used for application communication.",
+      "unrecognized": false
+    },
+    "base.phone": {
+      "key": "base.phone",
+      "label": "Phone",
+      "category": "absolute",
+      "description": "Primary phone number (include country code if applicable).",
+      "unrecognized": false
+    },
+    "base.address": {
+      "key": "base.address",
+      "label": "Address",
+      "category": "absolute",
+      "description": "Mailing address or location string the form expects (can be city/region/country if that's what the form asks for).",
+      "unrecognized": false
+    },
+    "base.age": {
+      "key": "base.age",
+      "label": "Age",
+      "category": "absolute",
+      "description": "Applicant age in years. Only provide if explicitly requested and appropriate for the locale/legal context.",
+      "unrecognized": false
+    },
+    "other.preferences.work_authorization": {
+      "key": "other.preferences.work_authorization",
+      "label": "Work authorization",
+      "category": "absolute",
+      "description": "Applicant's work authorization/right-to-work status for the job location (e.g. citizen, permanent resident, visa status).",
+      "unrecognized": false
+    },
+    "relative.salary_expectation": {
+      "key": "relative.salary_expectation",
+      "label": "Salary expectation",
+      "category": "relative",
+      "description": "Expected compensation for this specific role (number/range; specify gross vs net if relevant).",
+      "unrecognized": false
+    },
+    "relative.currency": {
+      "key": "relative.currency",
+      "label": "Salary currency",
+      "category": "relative",
+      "description": "Currency for the salary expectation (e.g. EUR, USD, GBP).",
+      "unrecognized": false
+    },
+    "relative.start_date": {
+      "key": "relative.start_date",
+      "label": "Earliest start date",
+      "category": "relative",
+      "description": "Earliest date the applicant can start for this job (consider notice period and availability).",
+      "unrecognized": false
+    },
+    "relative.notice_period": {
+      "key": "relative.notice_period",
+      "label": "Notice period",
+      "category": "relative",
+      "description": "Notice period required to leave current employment (e.g. '2 weeks', '1 month', 'immediate').",
+      "unrecognized": false
+    },
+    "relative.relocation_ok": {
+      "key": "relative.relocation_ok",
+      "label": "Relocation",
+      "category": "relative",
+      "description": "Whether the applicant is willing to relocate for this specific job/location.",
+      "unrecognized": false
+    },
+    "relative.remote_preference": {
+      "key": "relative.remote_preference",
+      "label": "Remote preference",
+      "category": "relative",
+      "description": "Preferred working arrangement for this job: onsite, hybrid, or remote (if the form offers these choices).",
+      "unrecognized": false
+    },
+    "relative.visa_sponsorship_needed": {
+      "key": "relative.visa_sponsorship_needed",
+      "label": "Visa sponsorship needed",
+      "category": "relative",
+      "description": "Whether the applicant would require visa sponsorship for this job's location.",
+      "unrecognized": false
+    },
+    "base.address.postal_code": {
+      "key": "base.address.postal_code",
+      "label": "base.address.postal_code",
+      "category": "absolute",
+      "description": "Please provide your postal code for this application (from your address: Munchenstr. 80, 85225 Berlin, Germany).",
+      "unrecognized": false
+    },
+    "base.address.zip_code": {
+      "key": "base.address.zip_code",
+      "label": "base.address.zip_code",
+      "category": "relative",
+      "description": "Please provide your zip code for this application (from your address: Munchenstr. 80, 85225 Berlin, Germany).",
+      "unrecognized": true
+    },
+    "form_of_address": {
+      "key": "form_of_address",
+      "label": "Form of address",
+      "category": "absolute",
+      "description": "Select your preferred form of address (e.g., Mr., Ms., Not specified). This is a required field in the application.",
+      "unrecognized": false
+    },
+    "title": {
+      "key": "title",
+      "label": "Title",
+      "category": "relative",
+      "description": "Select your academic or professional title if applicable (e.g., Dr., Prof.). This field is optional.",
+      "unrecognized": true
+    },
+    "language": {
+      "key": "language",
+      "label": "Language",
+      "category": "absolute",
+      "description": "Select your preferred language for communication from options: German, English, French.",
+      "unrecognized": false
+    },
+    "base.full_name.first_name": {
+      "key": "base.full_name.first_name",
+      "label": "First name",
+      "category": "absolute",
+      "description": "Value for 'First name' as requested by a job application form.",
+      "unrecognized": false
+    },
+    "base.full_name.last_name": {
+      "key": "base.full_name.last_name",
+      "label": "Last name",
+      "category": "absolute",
+      "description": "Value for 'Last name' as requested by a job application form.",
+      "unrecognized": false
+    },
+    "education.major_course_of_studies": {
+      "key": "education.major_course_of_studies",
+      "label": "Major course of studies",
+      "category": "relative",
+      "description": "The application form requires selecting your major course of studies from a dropdown. The available options are generic degree types (Associate Degree, High School Diploma / GED, Bachelor's Degree, Master's Degree, PhD, did not graduate high school) and do not include your specific field 'Computer Science'. Please specify how you would like to proceed with this field.",
+      "unrecognized": true
+    },
+    "job_ad_source.medium_type": {
+      "key": "job_ad_source.medium_type",
+      "label": "How did you hear about this job ad? (Medium type)",
+      "category": "relative",
+      "description": "Please specify how you heard about this Draeger Software Engineer position. The form has a dropdown with options like Magazine advertisement, Newspaper advertisement, etc. What would you like to select?",
+      "unrecognized": true
+    },
+    "documents.resume": {
+      "key": "documents.resume",
+      "label": "Resume",
+      "category": "relative",
+      "description": "Document upload slot for 'Resume' requested by a job application form.",
+      "unrecognized": false
+    },
+    "base.address.city": {
+      "key": "base.address.city",
+      "label": "City",
+      "category": "absolute",
+      "description": "Confirm or provide your city as it should appear on the application.",
+      "unrecognized": false
+    },
+    "country": {
+      "key": "country",
+      "label": "Country",
+      "category": "absolute",
+      "description": "Select your country from the dropdown list. Default is 'Germany' from your profile if desired.",
+      "unrecognized": false
+    },
+    "experience.professional_years": {
+      "key": "experience.professional_years",
+      "label": "Professional experience in years",
+      "category": "absolute",
+      "description": "Select your professional experience in years for this job entry (options: 0-3, 3-5, 5-8). Please confirm which applies.",
+      "unrecognized": false
+    },
+    "experience.professional_years.1": {
+      "key": "experience.professional_years.1",
+      "label": "Professional experience in years (Previous Inc)",
+      "category": "relative",
+      "description": "Select your professional experience in years for your position at Previous Inc (Software Engineer, 2018-06 to 2021-02). Options: 0-3, 3-5, 5-8.",
+      "unrecognized": true
+    }
+  }
+}
