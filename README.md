@@ -120,11 +120,11 @@ When a machine exceeds its budget or the provider returns "insufficient quota", 
 - Max parallel machines (live-editable; takes effect immediately).
 - Global budget ceiling.
 - Per-machine budget ceiling.
-- LLM provider keys (can be supplied through the UI or through a mounted `.env`).
+- LLM provider keys per platform (OpenAI, Anthropic, Google, Browser-Use…) — added directly from the **LLM providers** table in Settings, stored in MongoDB and pushed into agent containers as environment variables on every spawn / restart. No `.env` editing required.
 - Master schema editor (add fields, rename labels, tune descriptions the agents read).
 
 ![Settings page](docs/screenshots/settings-page.png)
-*The Settings page: LLM keys, default model, parallel-machine cap, per-run and global budgets, and the master schema editor for tuning the profile fields agents read.*
+*The Settings page: the LLM providers table (one row per platform, masked API key, expandable per-model pricing, and total spend pulled from the ledger), default model, parallel-machine cap, per-run and global budgets, and the master schema editor for tuning the profile fields agents read.*
 
 ### Applications tracker
 
@@ -203,16 +203,14 @@ Change it to match `pwd`.
 
 ### 3. Configure your LLM credentials
 
-Create a `.env` at the repo root (already in `.gitignore`):
+Once the stack is running you add provider keys from the **Settings → LLM providers** table in the UI. They're stored in MongoDB on the orchestrator and injected as environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `BROWSER_USE_API_KEY`, …) into every agent container at spawn / restart time. Saved keys are never returned to the browser in plaintext — only as a masked preview; to change one, replace it.
+
+Optional overrides for orchestrator-side tooling (PDF profile import, etc.) can still go in a `.env` at the repo root:
 
 ```dotenv
-OPENAI_API_KEY=sk-...
-# Optional overrides
 PROFILE_LLM_MODEL=gpt-4o-mini
 AGENT_LLM_PRICING_FILE=/repo/agent/pricing.json
 ```
-
-The file is mounted read-only into the orchestrator container, which forwards relevant keys to each agent it spawns. You can also paste keys directly into the UI's Settings page if you prefer not to use a file.
 
 ### 4. Build the agent image
 

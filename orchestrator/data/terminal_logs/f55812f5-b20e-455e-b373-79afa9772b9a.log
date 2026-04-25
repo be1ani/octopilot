@@ -1,0 +1,14 @@
+
+========================================================================
+2026-04-25T07:53:11.977492+00:00  [created]  machine_id=f55812f5-b20e-455e-b373-79afa9772b9a
+========================================================================
+Note: your profile references document file(s), but none were found on disk.
+Put PDFs under the project `attachments/` folder (paths in profiles_db are relative to that folder),
+or pass an absolute path with --allow-file.
+Attachments directory in use: /attachments
+
+INFO     [service] Using anonymized telemetry, see https://docs.browser-use.com/development/monitoring/telemetry.
+
+=== Final result ===
+
+The provided job application URL (https://erecruitment.draeger.com/index.php?ac=jobad&id=18852&utm_source=xing.com) appears to be unavailable (HTTP 410). Stopping the operation.

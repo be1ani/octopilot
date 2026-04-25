@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { ScreenshotCarousel } from "./ScreenshotCarousel.jsx";
 import { formatRelativeTime, urlHostname } from "../format.js";
-import { llmKeyHeaders } from "../llmKeys.js";
 import "./ApplicationsPage.css";
 
 function StatusPill({ status }) {
@@ -27,7 +26,7 @@ export function ApplicationsPage() {
   const refresh = async () => {
     setLoading(true);
     try {
-      const res = await fetch("/api/applications?limit=500", { headers: llmKeyHeaders() });
+      const res = await fetch("/api/applications?limit=500");
       const data = await res.json().catch(() => []);
       if (!res.ok) throw new Error(data?.error || res.statusText || "Request failed");
       setApps(Array.isArray(data) ? data : []);

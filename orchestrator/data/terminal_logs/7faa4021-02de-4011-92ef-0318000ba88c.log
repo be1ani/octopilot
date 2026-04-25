@@ -1,0 +1,19 @@
+
+========================================================================
+2026-04-25T07:53:35.133370+00:00  [created]  machine_id=7faa4021-02de-4011-92ef-0318000ba88c
+========================================================================
+Note: your profile references document file(s), but none were found on disk.
+Put PDFs under the project `attachments/` folder (paths in profiles_db are relative to that folder),
+or pass an absolute path with --allow-file.
+Attachments directory in use: /attachments
+
+INFO     [service] Using anonymized telemetry, see https://docs.browser-use.com/development/monitoring/telemetry.
+********** Window Positioning (full display) **********
+Monitor Geometry: 0, 0, 568, 800
+Window Size: 568, 800
+Window Position: 0, 0
+********************************************************
+OPENAI_API_KEY is not set (AGENT_LLM_PROVIDER=openai).
+Default is Google Gemini Flash; use GOOGLE_API_KEY or set another provider, e.g.:
+  AGENT_LLM_PROVIDER=anthropic  + ANTHROPIC_API_KEY
+  AGENT_LLM_PROVIDER=browser_use + BROWSER_USE_API_KEY

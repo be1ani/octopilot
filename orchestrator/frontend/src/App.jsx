@@ -5,7 +5,6 @@ import { ApplicationsPage } from "./components/ApplicationsPage.jsx";
 import { SettingsPage } from "./components/SettingsPage.jsx";
 import { ProfilesPage } from "./components/ProfilesPage.jsx";
 import { ToastHost } from "./components/ToastHost.jsx";
-import { llmKeyHeaders } from "./llmKeys.js";
 import "./App.css";
 
 const SIDEBAR_KEY = "octopilot.sidebarMinimized";
@@ -21,12 +20,10 @@ function readSidebarMinimized() {
 }
 
 async function fetchJson(path, options) {
-  const keyHeaders = llmKeyHeaders();
   const res = await fetch(path, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      ...keyHeaders,
       ...(options?.headers || {}),
     },
   });

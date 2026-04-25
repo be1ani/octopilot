@@ -233,3 +233,142 @@
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * LLM providers table
+ * ------------------------------------------------------------------------- */
+
+.llmp-empty {
+  margin-top: 0.85rem;
+  padding: 1.1rem 1rem;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  background: rgba(2, 6, 23, 0.22);
+}
+
+.llmp-empty-title {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.llmp-empty-sub {
+  margin-top: 0.3rem;
+  font-size: 0.85rem;
+  max-width: 70ch;
+}
+
+.llmp-add-card {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(2, 6, 23, 0.28);
+}
+
+.llmp-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.llmp-form-row {
+  display: flex;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.llmp-form-row select {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.55rem 0.65rem;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.llmp-form-actions {
+  display: flex;
+  gap: 0.45rem;
+  justify-content: flex-end;
+}
+
+.llmp-platform strong {
+  font-size: 0.9rem;
+}
+
+.llmp-platform-id {
+  font-size: 0.72rem;
+  margin-top: 0.05rem;
+}
+
+.llmp-expand-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(2, 6, 23, 0.35);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.75rem;
+  line-height: 1;
+}
+
+.llmp-expand-btn:hover {
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+.llmp-models-row td {
+  background: rgba(2, 6, 23, 0.45);
+}
+
+.llmp-models-title {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-bottom: 0.45rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.llmp-models-wrap {
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  overflow: auto;
+  background: rgba(2, 6, 23, 0.55);
+}
+
+.llmp-models {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.llmp-models thead th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+  white-space: nowrap;
+}
+
+.llmp-models tbody td {
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+  white-space: nowrap;
+}
+
+.llmp-empty-models {
+  padding: 0.5rem 0.6rem;
+  font-size: 0.82rem;
+}
+
+.llmp-danger {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.35);
+}
+
+.llmp-danger:hover {
+  border-color: rgba(248, 113, 113, 0.6);
+}
+

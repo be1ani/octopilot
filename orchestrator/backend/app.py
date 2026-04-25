@@ -263,6 +263,217 @@ def _orch_profiles_collection_name() -> str:
     return (os.environ.get("ORCH_PROFILES_COLLECTION") or "").strip() or "profiles"
 
 
+def _orch_llm_providers_collection_name() -> str:
+    return (os.environ.get("ORCH_LLM_PROVIDERS_COLLECTION") or "").strip() or "llm_providers"
+
+
+# Catalog of LLM providers the UI knows how to add. The order here is the
+# order the dropdown shows; `env_var` is what gets injected into agent
+# containers as -e flags so the per-job code (browser-use, langchain, etc.)
+# can pick the credential up. `model_prefixes` is used to bucket entries from
+# agent/pricing.json by provider so the table can show their per-model cost.
+LLM_PROVIDER_REGISTRY: list[dict[str, Any]] = [
+    {
+        "id": "openai",
+        "label": "OpenAI",
+        "env_var": "OPENAI_API_KEY",
+        "model_prefixes": ("gpt-", "o1", "o3", "o4", "chatgpt-", "text-embedding-", "computer-use-"),
+    },
+    {
+        "id": "openai-admin",
+        "label": "OpenAI Admin (usage reconciliation)",
+        "env_var": "OPENAI_ADMIN_KEY",
+        "model_prefixes": (),
+    },
+    {
+        "id": "anthropic",
+        "label": "Claude (Anthropic)",
+        "env_var": "ANTHROPIC_API_KEY",
+        "model_prefixes": ("claude",),
+    },
+    {
+        "id": "google",
+        "label": "Google (Gemini)",
+        "env_var": "GOOGLE_API_KEY",
+        "model_prefixes": ("gemini",),
+    },
+    {
+        "id": "browser-use",
+        "label": "Browser-Use",
+        "env_var": "BROWSER_USE_API_KEY",
+        "model_prefixes": ("bu-",),
+    },
+]
+
+LLM_PROVIDER_INDEX: dict[str, dict[str, Any]] = {p["id"]: p for p in LLM_PROVIDER_REGISTRY}
+
+
+def _llm_providers_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    coll = db[_orch_llm_providers_collection_name()]
+    try:
+        coll.create_index([("provider", 1)], unique=True, name="provider_unique")
+    except PyMongoError:
+        pass
+    return coll
+
+
+def _mask_api_key(key: str) -> str:
+    s = (key or "").strip()
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return "•" * len(s)
+    return f"{s[:4]}…{s[-4:]}"
+
+
+def _provider_for_model(model_id: str) -> str | None:
+    """Match a pricing.json model id to a registry provider id."""
+    s = (model_id or "").strip().lower()
+    if not s:
+        return None
+    for p in LLM_PROVIDER_REGISTRY:
+        for prefix in p.get("model_prefixes") or ():
+            if s.startswith(prefix):
+                return p["id"]
+    return None
+
+
+def _load_pricing_json() -> dict[str, Any]:
+    """Read agent/pricing.json (host-side) for read-only display."""
+    p = REPO_ROOT / "agent" / "pricing.json"
+    if not p.is_file():
+        return {}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _models_for_provider(provider_id: str) -> list[dict[str, Any]]:
+    """Return [{id, usd_per_1m_input, usd_per_1m_output, ...}] for one provider."""
+    pricing = _load_pricing_json()
+    models = pricing.get("models")
+    if not isinstance(models, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for model_id, info in models.items():
+        if not isinstance(info, dict):
+            continue
+        if _provider_for_model(model_id) != provider_id:
+            continue
+        row = {"id": model_id}
+        for k in ("usd_per_1m_input", "usd_per_1m_output", "usd_per_1m_cached_input"):
+            v = info.get(k)
+            if isinstance(v, (int, float)):
+                row[k] = float(v)
+        rows.append(row)
+    rows.sort(key=lambda r: r["id"])
+    return rows
+
+
+def _ledger_spend_by_provider(*, ledger_rel: str, max_lines: int = 20000) -> dict[str, float]:
+    """Sum cost_usd from the JSONL ledger, grouped by `provider` field."""
+    ledger_path, _ = _mountable_paths(ledger_rel)
+    if not ledger_path.is_file():
+        return {}
+    totals: dict[str, float] = {}
+    for line in _tail_lines(ledger_path, max_lines=max_lines, max_bytes=8_000_000):
+        s = (line or "").strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        prov = str(obj.get("provider") or "").strip()
+        cost = obj.get("cost_usd")
+        if not prov or not isinstance(cost, (int, float)):
+            continue
+        totals[prov] = totals.get(prov, 0.0) + float(cost)
+    return totals
+
+
+def _serialize_llm_provider(
+    doc: dict[str, Any],
+    *,
+    spend_index: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Build the public (key-redacted) view of a stored provider doc."""
+    pid = str(doc.get("provider") or doc.get("_id") or "").strip()
+    meta = LLM_PROVIDER_INDEX.get(pid) or {"id": pid, "label": pid, "env_var": "", "model_prefixes": ()}
+    api_key = str(doc.get("api_key") or "")
+    spend = float((spend_index or {}).get(pid, 0.0)) if spend_index else 0.0
+    return {
+        "provider": pid,
+        "label": meta.get("label") or pid,
+        "env_var": meta.get("env_var") or "",
+        "key_set": bool(api_key),
+        "key_masked": _mask_api_key(api_key),
+        "key_last4": api_key[-4:] if len(api_key) >= 4 else "",
+        "key_length": len(api_key),
+        "models": _models_for_provider(pid),
+        "spend_usd": round(spend, 6),
+        "updated_at": doc.get("updated_at"),
+        "created_at": doc.get("created_at"),
+    }
+
+
+def _list_llm_providers_public(spend_index: dict[str, float] | None = None) -> list[dict[str, Any]]:
+    coll = _llm_providers_coll()
+    docs = list(coll.find({}, {"provider": 1, "api_key": 1, "created_at": 1, "updated_at": 1}))
+    if spend_index is None:
+        with _state_lock:
+            data = load_state()
+            settings = _get_settings(data)
+            ledger_rel = (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL).strip()
+        spend_index = _ledger_spend_by_provider(ledger_rel=ledger_rel)
+    return [_serialize_llm_provider(d, spend_index=spend_index) for d in docs]
+
+
+def _get_llm_provider_key(provider_id: str) -> str:
+    """Look up the plaintext API key for a configured provider, or '' if absent."""
+    pid = (provider_id or "").strip().lower()
+    if not pid:
+        return ""
+    try:
+        coll = _llm_providers_coll()
+        doc = coll.find_one({"provider": pid}, {"api_key": 1})
+    except PyMongoError:
+        return ""
+    if not doc:
+        return ""
+    return str(doc.get("api_key") or "").strip()
+
+
+def _llm_provider_env_args() -> list[str]:
+    """
+    Build the -e <NAME>=<VALUE> argument list for `docker run`, sourced from
+    every provider configured in Mongo. Returns an empty list when no keys
+    are stored (agents will then fail loudly when they need a key, which is
+    the intended UX after the .env mount was removed).
+    """
+    args: list[str] = []
+    try:
+        coll = _llm_providers_coll()
+        docs = list(coll.find({}, {"provider": 1, "api_key": 1}))
+    except PyMongoError:
+        return args
+    for d in docs:
+        pid = str(d.get("provider") or "").strip()
+        meta = LLM_PROVIDER_INDEX.get(pid)
+        if not meta or not meta.get("env_var"):
+            continue
+        key = str(d.get("api_key") or "").strip()
+        if not key:
+            continue
+        args.extend(["-e", f"{meta['env_var']}={key}"])
+    return args
+
+
 def _mongo() -> MongoClient:
     global _mongo_client
     with _mongo_lock:
@@ -1330,6 +1541,87 @@ def patch_settings():
     return jsonify({"settings": settings})
 
 
+# ---------------------------------------------------------------------------
+# LLM provider keys (stored in MongoDB; injected into agent containers as -e flags)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/llm-providers")
+def list_llm_providers():
+    """
+    List configured LLM providers (with masked keys), plus the catalog of
+    providers the user can add. Returns:
+      {
+        "providers": [{provider, label, env_var, key_masked, key_last4, key_length,
+                       key_set, models[], spend_usd, created_at, updated_at}, ...],
+        "available": [{id, label, env_var}, ...]   # everything in the catalog
+      }
+    """
+    try:
+        providers = _list_llm_providers_public()
+    except PyMongoError as e:
+        return jsonify({"error": f"MongoDB error: {e}"}), 503
+    available = [
+        {"id": p["id"], "label": p["label"], "env_var": p["env_var"]}
+        for p in LLM_PROVIDER_REGISTRY
+    ]
+    return jsonify({"providers": providers, "available": available})
+
+
+@app.post("/api/llm-providers")
+def upsert_llm_provider():
+    """
+    Create or update a provider's API key. Body:
+      { "provider": "openai", "api_key": "sk-..." }
+    Returns the (key-redacted) public view of the saved row.
+    """
+    body = request.get_json(silent=True) or {}
+    pid = str(body.get("provider") or "").strip().lower()
+    api_key = str(body.get("api_key") or "").strip()
+    if not pid or pid not in LLM_PROVIDER_INDEX:
+        return jsonify({"error": "provider must be one of: " + ", ".join(LLM_PROVIDER_INDEX)}), 400
+    if not api_key:
+        return jsonify({"error": "api_key must be a non-empty string"}), 400
+    if len(api_key) > 1024:
+        return jsonify({"error": "api_key is unreasonably long"}), 400
+
+    now = _utc_iso()
+    try:
+        coll = _llm_providers_coll()
+        coll.update_one(
+            {"provider": pid},
+            {
+                "$set": {
+                    "provider": pid,
+                    "api_key": api_key,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+        doc = coll.find_one({"provider": pid}) or {"provider": pid, "api_key": api_key}
+    except PyMongoError as e:
+        return jsonify({"error": f"MongoDB error: {e}"}), 503
+
+    return jsonify({"provider": _serialize_llm_provider(doc)})
+
+
+@app.delete("/api/llm-providers/<provider>")
+def delete_llm_provider(provider: str):
+    """Remove a provider row (and its stored key)."""
+    pid = (provider or "").strip().lower()
+    if not pid or pid not in LLM_PROVIDER_INDEX:
+        return jsonify({"error": "unknown provider"}), 404
+    try:
+        coll = _llm_providers_coll()
+        res = coll.delete_one({"provider": pid})
+    except PyMongoError as e:
+        return jsonify({"error": f"MongoDB error: {e}"}), 503
+    if not res.deleted_count:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True, "provider": pid})
+
+
 @app.post("/api/reconcile/openai")
 def reconcile_openai_usage():
     """
@@ -1344,9 +1636,13 @@ def reconcile_openai_usage():
     end = (body.get("end") or "").strip()
     ledger_rel = (body.get("ledger_relpath") or "").strip()
 
-    admin_key = (request.headers.get("X-OpenAI-Admin-Key") or "").strip() or (os.environ.get("OPENAI_ADMIN_KEY") or "").strip()
+    admin_key = (
+        (request.headers.get("X-OpenAI-Admin-Key") or "").strip()
+        or _get_llm_provider_key("openai-admin")
+        or (os.environ.get("OPENAI_ADMIN_KEY") or "").strip()
+    )
     if not admin_key:
-        return jsonify({"error": "Missing OpenAI admin key (send X-OpenAI-Admin-Key header or set OPENAI_ADMIN_KEY)."}), 400
+        return jsonify({"error": "Missing OpenAI admin key (configure it in Settings → LLM providers, or send X-OpenAI-Admin-Key)."}), 400
     if not start or not end:
         return jsonify({"error": "Provide start and end (YYYY-MM-DD)."}), 400
 
@@ -1579,7 +1875,6 @@ def _spawn_machine_row(
     if not _valid_openai_model_id(llm_model):
         return None, "Invalid `llm_model` (expected a safe OpenAI model id)."
 
-    env_check, env_mount = _mountable_paths(".env")
     entrypoint_mount = _host_path("agent/docker/entrypoint.sh")
     attachments_host, attachments_ctr = _attachments_bind()
 
@@ -1596,6 +1891,7 @@ def _spawn_machine_row(
     if ledger_rel:
         ledger_host_check.parent.mkdir(parents=True, exist_ok=True)
         ledger_host_check.touch(exist_ok=True)
+    llm_env_args = _llm_provider_env_args()
 
     cmd = [
         "run",
@@ -1630,8 +1926,7 @@ def _spawn_machine_row(
         cmd.extend(["-e", "AGENT_LLM_LEDGER_PATH=/app/llm_ledger.jsonl"])
     if isinstance(pricing_overrides, dict) and pricing_overrides:
         cmd.extend(["-e", f"AGENT_LLM_PRICING_JSON={json.dumps(pricing_overrides)}"])
-    if env_check.is_file():
-        cmd.extend(["-v", f"{env_mount}:/app/.env:ro"])
+    cmd.extend(llm_env_args)
     cmd.extend(["-v", f"{entrypoint_mount}:/usr/local/bin/agent-entrypoint.sh:ro"])
     host_log, ctr_log = _prepare_terminal_log_bind(mid, "created")
     cmd.extend(["-v", f"{host_log}:{ctr_log}"])
@@ -1848,9 +2143,9 @@ def restart_machine(mid: str):
     if not docker_available():
         return jsonify({"error": "Docker is not available"}), 503
 
-    env_check, env_mount = _mountable_paths(".env")
     entrypoint_mount = _host_path("agent/docker/entrypoint.sh")
     attachments_host, attachments_ctr = _attachments_bind()
+    llm_env_args = _llm_provider_env_args()
 
     with _state_lock:
         data = load_state()
@@ -1915,8 +2210,7 @@ def restart_machine(mid: str):
             cmd.extend(["-e", "AGENT_LLM_LEDGER_PATH=/app/llm_ledger.jsonl"])
         if isinstance(pricing_overrides, dict) and pricing_overrides:
             cmd.extend(["-e", f"AGENT_LLM_PRICING_JSON={json.dumps(pricing_overrides)}"])
-        if env_check.is_file():
-            cmd.extend(["-v", f"{env_mount}:/app/.env:ro"])
+        cmd.extend(llm_env_args)
         cmd.extend(["-v", f"{entrypoint_mount}:/usr/local/bin/agent-entrypoint.sh:ro"])
         host_log, ctr_log = _prepare_terminal_log_bind(mid, "restarted")
         cmd.extend(["-v", f"{host_log}:{ctr_log}"])

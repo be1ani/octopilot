@@ -1,28 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
-import { clearLlmKeys, readLlmKeys, writeLlmKeys } from "../llmKeys.js";
+import { useEffect, useState } from "react";
+import { LlmProvidersTable } from "./LlmProvidersTable.jsx";
 import "./SettingsPage.css";
 
-function maskKey(k) {
-  const s = String(k || "");
-  if (!s) return "";
-  if (s.length <= 10) return "•".repeat(Math.max(6, s.length));
-  return `${s.slice(0, 4)}…${s.slice(-4)}`;
-}
-
-function envLine(name, value) {
-  const v = String(value || "").trim();
-  if (!v) return "";
-  // Minimal escaping: wrap in quotes if whitespace present.
-  const needsQuotes = /\s/.test(v);
-  const safe = needsQuotes ? `"${v.replaceAll('"', '\\"')}"` : v;
-  return `${name}=${safe}`;
-}
-
 export function SettingsPage() {
-  const [draft, setDraft] = useState(() => readLlmKeys());
-  const [show, setShow] = useState({ openai: false, anthropic: false, google: false });
-  const [savedAt, setSavedAt] = useState(0);
-  const [copied, setCopied] = useState(false);
   const [serverDraft, setServerDraft] = useState(null);
   const [serverBusy, setServerBusy] = useState(false);
   const [serverErr, setServerErr] = useState("");
@@ -36,16 +16,6 @@ export function SettingsPage() {
   const [ledgerLimit, setLedgerLimit] = useState(200);
   const [ledgerEdits, setLedgerEdits] = useState({});
   const [ledgerSaveBusy, setLedgerSaveBusy] = useState(false);
-
-  const envText = useMemo(() => {
-    const lines = [
-      envLine("OPENAI_API_KEY", draft.openai),
-      envLine("OPENAI_ADMIN_KEY", draft.openai_admin),
-      envLine("ANTHROPIC_API_KEY", draft.anthropic),
-      envLine("GOOGLE_API_KEY", draft.google),
-    ].filter(Boolean);
-    return lines.length ? `${lines.join("\n")}\n` : "";
-  }, [draft]);
 
   useEffect(() => {
     let alive = true;
@@ -71,156 +41,21 @@ export function SettingsPage() {
     };
   }, []);
 
-  const onSave = () => {
-    writeLlmKeys(draft);
-    setSavedAt(Date.now());
-  };
-
-  const onReset = () => {
-    setDraft(readLlmKeys());
-  };
-
-  const onClear = () => {
-    clearLlmKeys();
-    setDraft({ openai: "", openai_admin: "", anthropic: "", google: "" });
-    setSavedAt(Date.now());
-  };
-
-  const onCopyEnv = async () => {
-    if (!envText) return;
-    try {
-      await navigator.clipboard.writeText(envText);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
-    } catch {
-      // ignore: clipboard might be blocked; user can manually copy
-    }
-  };
-
   return (
     <div className="settings-page">
       <div className="settings-head">
         <div>
           <div className="settings-title">Settings</div>
           <div className="settings-sub muted">
-            Configure provider API keys locally in your browser. These values are stored in <span className="mono">localStorage</span>.
+            LLM provider keys are stored in MongoDB on the orchestrator and pushed into agent
+            containers as environment variables — no <span className="mono">.env</span> editing
+            required.
           </div>
-        </div>
-        <div className="settings-actions">
-          <button type="button" className="btn ghost" onClick={onReset}>
-            Reset
-          </button>
-          <button type="button" className="btn ghost" onClick={onClear}>
-            Clear
-          </button>
-          <button type="button" className="btn primary" onClick={onSave}>
-            Save
-          </button>
         </div>
       </div>
 
-      {savedAt ? (
-        <div className="banner warn" style={{ marginTop: "0.75rem" }}>
-          Saved. (Local only) Current values:{" "}
-          <span className="mono">
-            OpenAI {draft.openai ? maskKey(draft.openai) : "—"} · Claude {draft.anthropic ? maskKey(draft.anthropic) : "—"} · Google{" "}
-            {draft.google ? maskKey(draft.google) : "—"}
-          </span>
-        </div>
-      ) : null}
-
       <div className="settings-grid">
-        <section className="settings-card">
-          <div className="settings-card-title">OpenAI</div>
-          <label className="settings-field">
-            <span>API key</span>
-            <div className="settings-input-row">
-              <input
-                type={show.openai ? "text" : "password"}
-                value={draft.openai}
-                onChange={(e) => setDraft((d) => ({ ...d, openai: e.target.value }))}
-                placeholder="sk-…"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <button type="button" className="btn ghost btn--small" onClick={() => setShow((s) => ({ ...s, openai: !s.openai }))}>
-                {show.openai ? "Hide" : "Show"}
-              </button>
-            </div>
-          </label>
-          <label className="settings-field">
-            <span>Admin key (usage/costs reconciliation)</span>
-            <div className="settings-input-row">
-              <input
-                type="password"
-                value={draft.openai_admin || ""}
-                onChange={(e) => setDraft((d) => ({ ...d, openai_admin: e.target.value }))}
-                placeholder="sk-admin-…"
-                autoComplete="off"
-                spellCheck={false}
-              />
-            </div>
-          </label>
-        </section>
-
-        <section className="settings-card">
-          <div className="settings-card-title">Claude (Anthropic)</div>
-          <label className="settings-field">
-            <span>API key</span>
-            <div className="settings-input-row">
-              <input
-                type={show.anthropic ? "text" : "password"}
-                value={draft.anthropic}
-                onChange={(e) => setDraft((d) => ({ ...d, anthropic: e.target.value }))}
-                placeholder="sk-ant-…"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <button
-                type="button"
-                className="btn ghost btn--small"
-                onClick={() => setShow((s) => ({ ...s, anthropic: !s.anthropic }))}
-              >
-                {show.anthropic ? "Hide" : "Show"}
-              </button>
-            </div>
-          </label>
-        </section>
-
-        <section className="settings-card">
-          <div className="settings-card-title">Google (Gemini)</div>
-          <label className="settings-field">
-            <span>API key</span>
-            <div className="settings-input-row">
-              <input
-                type={show.google ? "text" : "password"}
-                value={draft.google}
-                onChange={(e) => setDraft((d) => ({ ...d, google: e.target.value }))}
-                placeholder="AIza…"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <button type="button" className="btn ghost btn--small" onClick={() => setShow((s) => ({ ...s, google: !s.google }))}>
-                {show.google ? "Hide" : "Show"}
-              </button>
-            </div>
-          </label>
-        </section>
-
-        <section className="settings-card settings-card--wide">
-          <div className="settings-card-title">Copy as .env</div>
-          <div className="settings-card-sub muted">
-            If you want the agent containers to use these keys, paste this into your repo’s <span className="mono">.env</span> (mounted into the agent).
-          </div>
-          <div className="settings-env">
-            <pre className="settings-pre">{envText || "# (no keys set)\n"}</pre>
-            <div className="settings-env-actions">
-              <button type="button" className="btn ghost btn--small" onClick={onCopyEnv} disabled={!envText}>
-                {copied ? "Copied" : "Copy"}
-              </button>
-            </div>
-          </div>
-        </section>
+        <LlmProvidersTable />
 
         <section className="settings-card settings-card--wide">
           <div className="settings-card-title">Orchestrator limits & budget</div>
@@ -372,7 +207,8 @@ export function SettingsPage() {
         <section className="settings-card settings-card--wide">
           <div className="settings-card-title">Reconcile OpenAI usage</div>
           <div className="settings-card-sub muted">
-            Runs <span className="mono">python -m agent.reconcile_openai_usage</span> on the orchestrator host. Requires the OpenAI <em>admin</em> key.
+            Runs <span className="mono">python -m agent.reconcile_openai_usage</span> on the orchestrator host. Uses the
+            stored <span className="mono">openai-admin</span> provider key (configure it in the table above).
           </div>
 
           <div className="settings-two-col">
@@ -394,12 +230,9 @@ export function SettingsPage() {
                 setReconcileBusy(true);
                 setReconcileOut("");
                 try {
-                  const hdrs = { "Content-Type": "application/json" };
-                  // Send admin key via header (stored locally).
-                  if (draft?.openai_admin) hdrs["X-OpenAI-Admin-Key"] = draft.openai_admin;
                   const res = await fetch("/api/reconcile/openai", {
                     method: "POST",
-                    headers: hdrs,
+                    headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                       start: reconcileStart,
                       end: reconcileEnd,
@@ -567,4 +400,3 @@ export function SettingsPage() {
     </div>
   );
 }
-

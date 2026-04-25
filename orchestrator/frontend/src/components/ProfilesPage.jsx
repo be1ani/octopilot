@@ -1,14 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { llmKeyHeaders } from "../llmKeys.js";
 import "./ProfilesPage.css";
 
 async function fetchJson(path, options) {
-  const keyHeaders = llmKeyHeaders();
   const res = await fetch(path, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      ...keyHeaders,
       ...(options?.headers || {}),
     },
   });
