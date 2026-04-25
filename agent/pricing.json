@@ -3,10 +3,11 @@
     "USD per 1,000,000 tokens. Optional keys: usd_per_1m_cached_input, usd_per_1m_audio_input, usd_per_1m_audio_output.",
     "Keep `last_updated` current; llm_usage.py warns when the file goes stale (AGENT_LLM_PRICING_MAX_AGE_DAYS).",
     "Point to this file via AGENT_LLM_PRICING_FILE. Values here OVERRIDE the defaults baked into llm_usage.py.",
-    "gpt-5.4* entries are provisional placeholders; update with the official numbers from platform.openai.com/docs/pricing when available."
+    "gpt-5.4* entries are provisional placeholders; update with the official numbers from platform.openai.com/docs/pricing when available.",
+    "deepseek-* entries reflect DeepSeek's published per-token rates; refresh from https://api-docs.deepseek.com/quick_start/pricing whenever the provider changes them."
   ],
-  "last_updated": "2026-04-19",
-  "source": "https://platform.openai.com/docs/pricing",
+  "last_updated": "2026-04-25",
+  "source": "https://platform.openai.com/docs/pricing (OpenAI), https://api-docs.deepseek.com/quick_start/pricing (DeepSeek)",
   "models": {
     "gpt-4.1":       {"usd_per_1m_input": 2.00, "usd_per_1m_output": 8.00,  "usd_per_1m_cached_input": 0.50},
     "gpt-4.1-mini":  {"usd_per_1m_input": 0.40, "usd_per_1m_output": 1.60,  "usd_per_1m_cached_input": 0.10},
@@ -32,6 +33,11 @@
     "claude-opus-4-6":     {"usd_per_1m_input": 5.00, "usd_per_1m_output": 25.00},
     "claude-opus-4-5":     {"usd_per_1m_input": 5.00, "usd_per_1m_output": 25.00},
     "gemini-flash-latest": {"usd_per_1m_input": 0.10, "usd_per_1m_output": 0.40},
+
+    "deepseek-v4-flash":   {"usd_per_1m_input": 0.14, "usd_per_1m_output": 0.28,  "usd_per_1m_cached_input": 0.028},
+    "deepseek-v4-pro":     {"usd_per_1m_input": 1.74, "usd_per_1m_output": 3.48,  "usd_per_1m_cached_input": 0.145},
+    "deepseek-chat":       {"usd_per_1m_input": 0.27, "usd_per_1m_output": 1.10, "usd_per_1m_cached_input": 0.07},
+    "deepseek-reasoner":   {"usd_per_1m_input": 0.55, "usd_per_1m_output": 2.19, "usd_per_1m_cached_input": 0.14},
 
     "bu-2-0": {"usd_per_1m_input": 0.60, "usd_per_1m_output": 3.50},
     "bu-1-0": {"usd_per_1m_input": 0.20, "usd_per_1m_output": 2.00}

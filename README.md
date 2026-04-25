@@ -34,7 +34,7 @@ OctoPilot is a **web task orchestrator** for LLM-driven browser agents. You give
 
 1. A **starting URL** (a form, a search page, a portal, a dashboard — anything on the open web).
 2. A **profile** (structured data the agent can pull from when the page asks for it — name, preferences, a resume, custom fields).
-3. A **model** (any supported ChatGPT model).
+3. A **model** (any supported LLM — OpenAI ChatGPT, DeepSeek, …).
 
 OctoPilot then launches a throwaway container running a real desktop browser, hands the task to the agent, and streams the desktop back to you in real time. You can watch it think, interrupt it at any LLM step, or walk up to the keyboard and finish the job yourself.
 
@@ -62,7 +62,7 @@ OctoPilot ships with a reference workflow for **job applications** (PDF resume �
 Start as many agents as your `max_parallel_machines` budget allows. Each runs in its own Docker container with its own Chromium, its own Xvfb display, its own filesystem, and its own control plane. The dashboard polls every two seconds and reflects per-agent status, token usage, cost, and current URL.
 
 ![Starting a new agent from the launcher modal](docs/screenshots/start-job-modal.png)
-*The "Start Job" launcher: pick a starting URL, choose a profile from the dropdown (resumes imported via PDF appear here), and pick a ChatGPT model. The sidebar also shows aggregate stats and the global parallel-machine limit.*
+*The "Start Job" launcher: pick a starting URL, choose a profile from the dropdown (resumes imported via PDF appear here), and pick an LLM model (OpenAI ChatGPT, DeepSeek, …). The sidebar also shows aggregate stats and the global parallel-machine limit.*
 
 ### Live view + web terminal, per agent
 
@@ -100,6 +100,7 @@ Import a PDF (typically a resume), and OctoPilot runs it through an LLM to produ
 - Absolute fields (name, email, address…).
 - Relative fields (salary expectation, start date, work authorization for *this* role).
 - Custom fields the agent can add on the fly when it hits an unrecognized question — you review and approve them later.
+- **Attachments** — per-profile documents (resumes, cover letters, transcripts…) uploaded straight from the Profiles page. Each file is stored under `attachments/<profile_id>/` and recorded inside the profile JSON as a `{ display_name: relative_path }` map. The agent container bind-mounts `attachments/` read-only and exposes every file in the profile's `attachments` group as an available file to the LLM.
 
 ![Profiles page with PDF import and field editor](docs/screenshots/profiles-page.png)
 *The Profiles page: left — list of stored profiles with PDF import button; right — the structured field editor with absolute vs relative categories, custom fields added by agents highlighted for review.*
@@ -120,7 +121,7 @@ When a machine exceeds its budget or the provider returns "insufficient quota", 
 - Max parallel machines (live-editable; takes effect immediately).
 - Global budget ceiling.
 - Per-machine budget ceiling.
-- LLM provider keys per platform (OpenAI, Anthropic, Google, Browser-Use…) — added directly from the **LLM providers** table in Settings, stored in MongoDB and pushed into agent containers as environment variables on every spawn / restart. No `.env` editing required.
+- LLM provider keys per platform (OpenAI, DeepSeek, Anthropic, Google, Browser-Use…) — added directly from the **LLM providers** table in Settings, stored in MongoDB and pushed into agent containers as environment variables on every spawn / restart. No `.env` editing required.
 - Master schema editor (add fields, rename labels, tune descriptions the agents read).
 
 ![Settings page](docs/screenshots/settings-page.png)
@@ -178,7 +179,7 @@ Every agent stores a screenshot at each turn. The carousel on each card lets you
 - **Linux** host (tested on Ubuntu 24.04 / kernel 6.x). macOS and Windows should work via Docker Desktop but are untested by the maintainers.
 - **Docker Engine** with the Compose plugin (`docker compose version` must succeed).
 - **~8 GB RAM** free when running 3–4 agents in parallel; each agent container is a full Chromium + Xvfb desktop.
-- **OpenAI API key** (or any other provider supported by `browser-use` / LangChain — configurable per agent).
+- **An LLM API key** — OpenAI, DeepSeek, or any other provider supported by `browser-use` / LangChain. The provider used is selected per agent at start time.
 - **Ports free on the host**: `5050` (orchestrator API), `5080` (orchestrator UI), `27017` (MongoDB). Agent containers expose `6080` / `7681` internally; the orchestrator brokers them.
 - Python **3.12+** is only needed if you plan to run `manage_profiles.py` from the host. Everything else runs inside containers.
 
@@ -203,7 +204,9 @@ Change it to match `pwd`.
 
 ### 3. Configure your LLM credentials
 
-Once the stack is running you add provider keys from the **Settings → LLM providers** table in the UI. They're stored in MongoDB on the orchestrator and injected as environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `BROWSER_USE_API_KEY`, …) into every agent container at spawn / restart time. Saved keys are never returned to the browser in plaintext — only as a masked preview; to change one, replace it.
+Once the stack is running you add provider keys from the **Settings → LLM providers** table in the UI. They're stored in MongoDB on the orchestrator and injected as environment variables (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `BROWSER_USE_API_KEY`, …) into every agent container at spawn / restart time. Saved keys are never returned to the browser in plaintext — only as a masked preview; to change one, replace it.
+
+The orchestrator picks the provider for each run from the chosen model id — `deepseek-*` ids dispatch to DeepSeek's OpenAI-compatible API (`https://api.deepseek.com/v1`), `gpt-*` / `o1`-`o4` / `chatgpt-*` ids dispatch to OpenAI, etc. Prefer **`deepseek-v4-flash`** (V4-Flash) or **`deepseek-v4-pro`** for new work; older `deepseek-chat` / `deepseek-reasoner` names are legacy compatibility aliases. So as long as the matching API key is stored in **Settings → LLM providers**, switching models is a one-click change with no `.env` editing.
 
 Optional overrides for orchestrator-side tooling (PDF profile import, etc.) can still go in a `.env` at the repo root:
 

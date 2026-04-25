@@ -272,36 +272,60 @@ def _orch_llm_providers_collection_name() -> str:
 # containers as -e flags so the per-job code (browser-use, langchain, etc.)
 # can pick the credential up. `model_prefixes` is used to bucket entries from
 # agent/pricing.json by provider so the table can show their per-model cost.
+# `agent_provider` is the value the agent process expects in
+# `AGENT_LLM_PROVIDER` (see `_make_agent_llm` in agent/cli.py).
+# `model_env_var` is the per-provider env var the agent reads to pick the
+# specific model id (e.g. OPENAI_MODEL, DEEPSEEK_MODEL, …).
 LLM_PROVIDER_REGISTRY: list[dict[str, Any]] = [
     {
         "id": "openai",
         "label": "OpenAI",
         "env_var": "OPENAI_API_KEY",
         "model_prefixes": ("gpt-", "o1", "o3", "o4", "chatgpt-", "text-embedding-", "computer-use-"),
+        "agent_provider": "openai",
+        "model_env_var": "OPENAI_MODEL",
     },
     {
         "id": "openai-admin",
         "label": "OpenAI Admin (usage reconciliation)",
         "env_var": "OPENAI_ADMIN_KEY",
         "model_prefixes": (),
+        # Reconciliation-only credential: never selectable as an agent
+        # provider.
+        "agent_provider": None,
+        "model_env_var": None,
     },
     {
         "id": "anthropic",
         "label": "Claude (Anthropic)",
         "env_var": "ANTHROPIC_API_KEY",
         "model_prefixes": ("claude",),
+        "agent_provider": "anthropic",
+        "model_env_var": "ANTHROPIC_MODEL",
     },
     {
         "id": "google",
         "label": "Google (Gemini)",
         "env_var": "GOOGLE_API_KEY",
         "model_prefixes": ("gemini",),
+        "agent_provider": "google",
+        "model_env_var": "GOOGLE_MODEL",
+    },
+    {
+        "id": "deepseek",
+        "label": "DeepSeek",
+        "env_var": "DEEPSEEK_API_KEY",
+        "model_prefixes": ("deepseek-",),
+        "agent_provider": "deepseek",
+        "model_env_var": "DEEPSEEK_MODEL",
     },
     {
         "id": "browser-use",
         "label": "Browser-Use",
         "env_var": "BROWSER_USE_API_KEY",
         "model_prefixes": ("bu-",),
+        "agent_provider": "browser_use",
+        "model_env_var": "BROWSER_USE_MODEL",
     },
 ]
 
@@ -474,6 +498,28 @@ def _llm_provider_env_args() -> list[str]:
     return args
 
 
+def _agent_runtime_env_for_model(llm_model: str) -> list[str]:
+    """
+    Build the `-e AGENT_LLM_PROVIDER=...` and `-e <PROVIDER>_MODEL=...` flags
+    for an agent container based on the user-selected ``llm_model``.
+
+    Detection is prefix-based via :func:`_provider_for_model`. Anything that
+    can't be mapped (custom fine-tunes, brand-new model ids) falls back to
+    OpenAI so existing flows keep working as they did before this helper was
+    introduced.
+    """
+    pid = _provider_for_model(llm_model) or "openai"
+    meta = LLM_PROVIDER_INDEX.get(pid) or LLM_PROVIDER_INDEX["openai"]
+    agent_provider = meta.get("agent_provider") or "openai"
+    model_env_var = meta.get("model_env_var") or "OPENAI_MODEL"
+    return [
+        "-e",
+        f"AGENT_LLM_PROVIDER={agent_provider}",
+        "-e",
+        f"{model_env_var}={llm_model}",
+    ]
+
+
 def _mongo() -> MongoClient:
     global _mongo_client
     with _mongo_lock:
@@ -514,6 +560,127 @@ def _save_profiles_db(db: dict[str, Any]) -> None:
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(db, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(p)
+
+
+# ---------------------------------------------------------------------------
+# Profile attachments helpers
+#
+# Layout: every uploaded file lives at  attachments/<profile_id>/<filename>
+# (sanitized filename, with " (2)", " (3)" … suffixes appended on collision so
+# we never silently overwrite a file). Inside the profile JSON we keep a
+# `attachments` map of `display_name -> repo-relative path`. The agent already
+# bind-mounts `attachments/` read-only and exposes every file under it as an
+# available file at runtime.
+# ---------------------------------------------------------------------------
+
+# Repo-relative dir used for both on-disk storage and the path stored in profiles.
+_ATTACHMENTS_REPO_DIR = "attachments"
+
+
+def _attachments_root_local() -> Path:
+    """Filesystem path where the orchestrator reads/writes attachment files."""
+    root = REPO_ROOT / _ATTACHMENTS_REPO_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _profile_attachments_dir(profile_id: str) -> Path:
+    """Per-profile attachments dir on disk (creates it on first use)."""
+    safe_id = _safe_path_segment(profile_id)
+    if not safe_id:
+        raise ValueError("profile_id must contain at least one path-safe character")
+    d = _attachments_root_local() / safe_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _safe_path_segment(s: str) -> str:
+    """
+    Sanitize a single path segment (profile_id, filename, ...). Allows letters,
+    digits, dot, underscore, dash, and space; collapses runs of whitespace.
+    """
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"[\\/]+", "_", s)
+    s = re.sub(r"[\x00-\x1f]+", "", s)
+    s = re.sub(r"[^A-Za-z0-9._\- ()]+", "_", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.lstrip(".")
+    return s or "_"
+
+
+def _ensure_attachments_map(profile: dict[str, Any]) -> dict[str, Any]:
+    """Ensure profile['attachments'] exists as a dict; return it."""
+    att = profile.get("attachments")
+    if not isinstance(att, dict):
+        att = {}
+        profile["attachments"] = att
+    return att
+
+
+def _unique_display_name(existing: dict[str, Any], desired: str) -> str:
+    """Append ' (2)', ' (3)', … until the name is free in `existing`."""
+    base = desired.strip() or "Attachment"
+    if base not in existing:
+        return base
+    n = 2
+    while True:
+        candidate = f"{base} ({n})"
+        if candidate not in existing:
+            return candidate
+        n += 1
+
+
+def _unique_disk_filename(directory: Path, desired: str) -> str:
+    """Append ' (2)', ' (3)', … before the extension until the file is free."""
+    safe = _safe_path_segment(desired) or "file"
+    if not (directory / safe).exists():
+        return safe
+    stem, dot, ext = safe.partition(".")
+    if not dot:
+        stem, ext = safe, ""
+    n = 2
+    while True:
+        candidate = f"{stem} ({n})" + (f".{ext}" if ext else "")
+        if not (directory / candidate).exists():
+            return candidate
+        n += 1
+
+
+def _attachment_record(profile_id: str, name: str, repo_rel_path: str) -> dict[str, Any]:
+    """Build the JSON shape returned to the frontend for one attachment row."""
+    fs_path = REPO_ROOT / repo_rel_path
+    try:
+        st = fs_path.stat()
+        size = int(st.st_size)
+        mtime = float(st.st_mtime)
+    except OSError:
+        size = 0
+        mtime = 0.0
+    import mimetypes  # local import: rarely used elsewhere
+    mime, _ = mimetypes.guess_type(fs_path.name)
+    iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat() if mtime else None
+    return {
+        "name": name,
+        "filename": fs_path.name,
+        "path": repo_rel_path,
+        "size": size,
+        "mime": mime,
+        "uploaded_at": iso,
+        "exists": fs_path.is_file(),
+    }
+
+
+def _persist_profile(coll: Collection, profile_id: str, profile: dict[str, Any]) -> None:
+    """Replace the stored profile document and bump updated_at."""
+    profile["profile_id"] = profile_id
+    profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+    coll.replace_one(
+        {"profile_id": profile_id},
+        {"profile_id": profile_id, "profile": profile},
+        upsert=True,
+    )
 
 
 def _ensure_custom_maps(profile: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -680,6 +847,13 @@ def _tail_lines(path: Path, *, max_lines: int = 200, max_bytes: int = 2_000_000)
 
 
 def _valid_openai_model_id(s: str) -> bool:
+    """
+    Cheap allow-list check for an LLM model id.
+
+    The name dates from when only OpenAI models were supported; the regex is
+    intentionally permissive enough to cover every provider we now plug in
+    (e.g. `deepseek-chat`, `claude-opus-4-6`, `gemini-flash-latest`, `bu-2-0`).
+    """
     s = (s or "").strip()
     if not s or len(s) > 96:
         return False
@@ -1916,11 +2090,8 @@ def _spawn_machine_row(
         f"ORCH_MACHINE_ID={mid}",
         "-e",
         "ORCH_API_BASE=http://host.docker.internal:5050",
-        "-e",
-        "AGENT_LLM_PROVIDER=openai",
-        "-e",
-        f"OPENAI_MODEL={llm_model}",
     ]
+    cmd.extend(_agent_runtime_env_for_model(llm_model))
     if ledger_rel:
         cmd.extend(["-v", f"{ledger_host_mount}:/app/llm_ledger.jsonl"])
         cmd.extend(["-e", "AGENT_LLM_LEDGER_PATH=/app/llm_ledger.jsonl"])
@@ -2193,11 +2364,8 @@ def restart_machine(mid: str):
             f"ORCH_MACHINE_ID={mid}",
             "-e",
             "ORCH_API_BASE=http://host.docker.internal:5050",
-            "-e",
-            "AGENT_LLM_PROVIDER=openai",
-            "-e",
-            f"OPENAI_MODEL={llm_model}",
         ]
+        cmd.extend(_agent_runtime_env_for_model(llm_model))
         # Inject pricing overrides + ledger path (same as initial spawn).
         settings = _get_settings(data)
         pricing_overrides = settings.get("llm_pricing_overrides")
@@ -2687,6 +2855,182 @@ def delete_profile(profile_id: str):
     except PyMongoError:
         return jsonify({"error": "Failed to write profiles store"}), 500
     return jsonify({"ok": True})
+
+
+@app.get("/api/profiles/<profile_id>/attachments")
+def list_attachments(profile_id: str):
+    """
+    List uploaded documents for a profile.
+
+    Returns: { "attachments": [ {name, filename, path, size, mime, uploaded_at, exists}, ... ] }
+    """
+    profile_id = (profile_id or "").strip()
+    if not profile_id:
+        return jsonify({"error": "profile_id required"}), 400
+    try:
+        coll = _profiles_coll()
+        doc = coll.find_one({"profile_id": profile_id}, {"profile": 1})
+        prof = doc.get("profile") if isinstance(doc, dict) else None
+        if not isinstance(prof, dict):
+            return jsonify({"error": "not found"}), 404
+        att = prof.get("attachments")
+        if not isinstance(att, dict):
+            att = {}
+        rows = [_attachment_record(profile_id, name, str(path)) for name, path in att.items() if isinstance(path, str)]
+        rows.sort(key=lambda r: (r.get("name") or "").lower())
+        return jsonify({"profile_id": profile_id, "attachments": rows})
+    except PyMongoError:
+        return jsonify({"error": "Failed to read profiles store"}), 500
+
+
+@app.post("/api/profiles/<profile_id>/attachments")
+def upload_attachment(profile_id: str):
+    """
+    Upload a new attachment for a profile.
+
+    multipart/form-data:
+      file: <required, the file>
+      name: <optional display name; defaults to filename without extension>
+
+    Behavior:
+      - Files land at  attachments/<profile_id>/<sanitized-filename>
+      - On-disk filename gets a numeric suffix on collision (never overwrite)
+      - Display name gets a numeric suffix on collision (keys must be unique)
+    """
+    profile_id = (profile_id or "").strip()
+    if not profile_id:
+        return jsonify({"error": "profile_id required"}), 400
+
+    f = request.files.get("file")
+    if f is None or not getattr(f, "filename", None):
+        return jsonify({"error": "file is required"}), 400
+
+    desired_name = (request.form.get("name") or "").strip()
+
+    try:
+        coll = _profiles_coll()
+        doc = coll.find_one({"profile_id": profile_id}, {"profile": 1})
+        prof = doc.get("profile") if isinstance(doc, dict) else None
+        if not isinstance(prof, dict):
+            return jsonify({"error": "not found"}), 404
+        prof = dict(prof)
+        att = _ensure_attachments_map(prof)
+
+        target_dir = _profile_attachments_dir(profile_id)
+        original_name = _safe_path_segment(f.filename) or "upload"
+        on_disk_name = _unique_disk_filename(target_dir, original_name)
+        target_path = target_dir / on_disk_name
+
+        # Stream-save (Werkzeug FileStorage exposes .save() but we want to be defensive
+        # about the parent dir already existing).
+        f.save(str(target_path))
+
+        # Default display name = filename without extension if user left it blank.
+        if not desired_name:
+            stem, dot, _ext = original_name.partition(".")
+            desired_name = (stem if dot else original_name) or "Attachment"
+        display_name = _unique_display_name(att, desired_name)
+
+        repo_rel = f"{_ATTACHMENTS_REPO_DIR}/{_safe_path_segment(profile_id)}/{on_disk_name}"
+        att[display_name] = repo_rel
+
+        try:
+            _persist_profile(coll, profile_id, prof)
+        except PyMongoError:
+            # Roll back the on-disk write so we don't get an orphan file.
+            try:
+                target_path.unlink()
+            except OSError:
+                pass
+            return jsonify({"error": "Failed to write profiles store"}), 500
+
+        return jsonify({
+            "ok": True,
+            "profile_id": profile_id,
+            "attachment": _attachment_record(profile_id, display_name, repo_rel),
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except OSError as e:
+        return jsonify({"error": f"Failed to save file: {e}"}), 500
+    except PyMongoError:
+        return jsonify({"error": "Failed to read profiles store"}), 500
+
+
+@app.get("/api/profiles/<profile_id>/attachments/<path:name>/download")
+def download_attachment(profile_id: str, name: str):
+    """Stream the file for `name` back to the client with a Content-Disposition."""
+    profile_id = (profile_id or "").strip()
+    name = (name or "").strip()
+    if not profile_id or not name:
+        return jsonify({"error": "profile_id and name required"}), 400
+    try:
+        coll = _profiles_coll()
+        doc = coll.find_one({"profile_id": profile_id}, {"profile": 1})
+        prof = doc.get("profile") if isinstance(doc, dict) else None
+        if not isinstance(prof, dict):
+            return jsonify({"error": "not found"}), 404
+        att = prof.get("attachments")
+        if not isinstance(att, dict) or name not in att:
+            return jsonify({"error": "attachment not found"}), 404
+        rel = str(att.get(name) or "").strip()
+    except PyMongoError:
+        return jsonify({"error": "Failed to read profiles store"}), 500
+
+    # Sanity: stored path must stay under attachments/.
+    if not rel or ".." in rel.split("/") or not rel.startswith(f"{_ATTACHMENTS_REPO_DIR}/"):
+        return jsonify({"error": "invalid attachment path"}), 500
+
+    target = (REPO_ROOT / rel).resolve()
+    try:
+        target.relative_to(_attachments_root_local().resolve())
+    except ValueError:
+        return jsonify({"error": "invalid attachment path"}), 500
+    if not target.is_file():
+        return jsonify({"error": "file missing on disk"}), 410
+
+    return send_from_directory(
+        target.parent,
+        target.name,
+        as_attachment=True,
+        download_name=target.name,
+    )
+
+
+@app.delete("/api/profiles/<profile_id>/attachments/<path:name>")
+def delete_attachment(profile_id: str, name: str):
+    """Hard-delete: remove the file from disk AND the entry from the profile JSON."""
+    profile_id = (profile_id or "").strip()
+    name = (name or "").strip()
+    if not profile_id or not name:
+        return jsonify({"error": "profile_id and name required"}), 400
+    try:
+        coll = _profiles_coll()
+        doc = coll.find_one({"profile_id": profile_id}, {"profile": 1})
+        prof = doc.get("profile") if isinstance(doc, dict) else None
+        if not isinstance(prof, dict):
+            return jsonify({"error": "not found"}), 404
+        prof = dict(prof)
+        att = _ensure_attachments_map(prof)
+        if name not in att:
+            return jsonify({"error": "attachment not found"}), 404
+        rel = str(att.pop(name) or "").strip()
+
+        # Best-effort file delete: we keep the JSON change even if the file is
+        # already gone (so the table doesn't show a phantom row).
+        if rel and rel.startswith(f"{_ATTACHMENTS_REPO_DIR}/") and ".." not in rel.split("/"):
+            target = (REPO_ROOT / rel).resolve()
+            try:
+                target.relative_to(_attachments_root_local().resolve())
+                if target.is_file():
+                    target.unlink()
+            except (ValueError, OSError):
+                pass
+
+        _persist_profile(coll, profile_id, prof)
+        return jsonify({"ok": True, "profile_id": profile_id, "name": name})
+    except PyMongoError:
+        return jsonify({"error": "Failed to write profiles store"}), 500
 
 
 @app.post("/api/profiles/<profile_id>/custom-fields")

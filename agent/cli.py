@@ -198,6 +198,27 @@ def _stable_submit_key(action_description: str, page_url: str | None) -> str:
     return f"{bucket}@{url}@{desc[:60] or 'unknown'}"
 
 
+def _normalize_deepseek_model(env_value: str | None) -> str:
+    """
+    Map DEEPSEEK_MODEL to a DeepSeek API id. Default is deepseek-v4-flash (V4-Flash;
+    see https://api-docs.deepseek.com/quick_start/pricing). Legacy deepseek-chat /
+    deepseek-reasoner are still accepted.
+    """
+    raw = (env_value or "").strip()
+    if not raw:
+        return "deepseek-v4-flash"
+    key = raw.lower()
+    if key in ("deepseek-v3", "v3", "chat"):
+        return "deepseek-chat"
+    if key in ("deepseek-r1", "r1", "reasoner"):
+        return "deepseek-reasoner"
+    if key in ("v4", "v4-flash", "v4f"):
+        return "deepseek-v4-flash"
+    if key in ("v4-pro", "v4p"):
+        return "deepseek-v4-pro"
+    return raw
+
+
 def _make_agent_llm() -> Any:
     """
     LLM for the browser agent. Default is Google Gemini Flash (pay-as-you-go).
@@ -207,6 +228,9 @@ def _make_agent_llm() -> Any:
                     Optional: GEMINI_NATIVE_JSON_SCHEMA=true to use Gemini native JSON schema (can 400 on complex tools).
       openai      — OPENAI_API_KEY, OPENAI_MODEL (default gpt-4.1; set gpt-4.1-mini to cut cost)
       anthropic   — ANTHROPIC_API_KEY, ANTHROPIC_MODEL (default claude-opus-4-6)
+      deepseek    — DEEPSEEK_API_KEY, DEEPSEEK_MODEL (default deepseek-v4-flash; shorthands v4, v4-flash, v4-pro; legacy
+                    deepseek-chat / deepseek-reasoner). Optional: DEEPSEEK_BASE_URL (defaults to https://api.deepseek.com/v1;
+                    append /beta for the prefix-completion preview endpoint).
       browser_use — BROWSER_USE_API_KEY, BROWSER_USE_MODEL (default bu-2-0 / BU 2.0; alias bu-2)
     """
     provider = (os.getenv("AGENT_LLM_PROVIDER") or "google").strip().lower()
@@ -284,9 +308,28 @@ def _make_agent_llm() -> Any:
             api_key=os.getenv("BROWSER_USE_API_KEY"),
         )
 
+    if provider == "deepseek":
+        # DeepSeek exposes an OpenAI-compatible /chat/completions endpoint.
+        # browser-use ships a dedicated wrapper; importing from the submodule
+        # because `ChatDeepSeek` is not re-exported at the package root.
+        from browser_use.llm.deepseek.chat import ChatDeepSeek
+
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise SystemExit(
+                "DEEPSEEK_API_KEY is not set (required when AGENT_LLM_PROVIDER=deepseek).\n"
+                "Get a key from https://platform.deepseek.com/ → API keys."
+            )
+        raw = _normalize_deepseek_model(os.getenv("DEEPSEEK_MODEL"))
+        kwargs: dict[str, Any] = {"model": raw, "api_key": api_key}
+        base_url = (os.getenv("DEEPSEEK_BASE_URL") or "").strip()
+        if base_url:
+            kwargs["base_url"] = base_url
+        return ChatDeepSeek(**kwargs)
+
     raise SystemExit(
         f"Unknown AGENT_LLM_PROVIDER={provider!r}. "
-        "Use openai, anthropic, google, or browser_use."
+        "Use openai, anthropic, google, deepseek, or browser_use."
     )
 
 
@@ -303,6 +346,8 @@ def _llm_provider_and_model_for_env() -> tuple[str, str]:
         if raw in ("bu-2", "bu2"):
             raw = "bu-2-0"
         return "browser_use", raw
+    if provider == "deepseek":
+        return "deepseek", _normalize_deepseek_model(os.getenv("DEEPSEEK_MODEL"))
     return provider, ""
 
 
@@ -900,25 +945,14 @@ def _collect_available_file_paths(profile: dict[str, Any], extra_paths: list[str
     paths: list[str] = []
     attachments = _attachments_dir()
 
-    # Common places where a resume path might live in this project
-    for key in ("source_pdf_path", "resume_pdf_path", "resume_path"):
-        v = profile.get(key)
-        if isinstance(v, str) and v.strip():
-            paths.append(_resolve_profile_file_ref(v.strip(), attachments))
-
-    # Optional document bucket in profile.other.custom.documents
-    try:
-        docs = profile.get("other", {}).get("custom", {}).get("documents")  # type: ignore[union-attr]
-        if isinstance(docs, dict):
-            for v in docs.values():
-                if isinstance(v, str) and v.strip():
-                    paths.append(_resolve_profile_file_ref(v.strip(), attachments))
-        elif isinstance(docs, list):
-            for v in docs:
-                if isinstance(v, str) and v.strip():
-                    paths.append(_resolve_profile_file_ref(v.strip(), attachments))
-    except Exception:
-        pass
+    # Profile-scoped uploads: a name -> repo-relative-path map populated by the
+    # orchestrator's `/api/profiles/<id>/attachments` endpoints. Each entry
+    # points at a file under `attachments/<profile_id>/`.
+    att = profile.get("attachments")
+    if isinstance(att, dict):
+        for v in att.values():
+            if isinstance(v, str) and v.strip():
+                paths.append(_resolve_profile_file_ref(v.strip(), attachments))
 
     paths.extend(_resolve_profile_file_ref(p, attachments) for p in extra_paths if p.strip())
 
@@ -2336,23 +2370,17 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     profile_obj = _ensure_minimum_profile_fields(profile_obj)
     available_files = _collect_available_file_paths(profile_obj, list(args.allow_file))
-    # If profile references document paths but nothing resolved, give a clear hint.
+    # If the profile lists attachments but none of them resolved, give the user a clear hint.
     att = _attachments_dir()
-    has_doc_refs = bool(
-        isinstance(profile_obj.get("source_pdf_path"), str) and (profile_obj.get("source_pdf_path") or "").strip()
+    profile_attachments = profile_obj.get("attachments")
+    has_doc_refs = isinstance(profile_attachments, dict) and any(
+        isinstance(v, str) and v.strip() for v in profile_attachments.values()
     )
-    if not has_doc_refs:
-        try:
-            docs = (profile_obj.get("other") or {}).get("custom", {}).get("documents")
-            if isinstance(docs, dict) and any(isinstance(v, str) and v.strip() for v in docs.values()):
-                has_doc_refs = True
-        except Exception:
-            pass
     if has_doc_refs and not available_files:
         hint = (
-            "Note: your profile references document file(s), but none were found on disk.\n"
-            "Put PDFs under the project `attachments/` folder (paths in profiles_db are relative to that folder),\n"
-            "or pass an absolute path with --allow-file.\n"
+            "Note: your profile references attachment file(s), but none were found on disk.\n"
+            "Upload them from the Profiles page in the orchestrator UI; they land under\n"
+            "`attachments/<profile_id>/`. The agent mounts that folder read-only at runtime.\n"
         )
         if att:
             hint += f"Attachments directory in use: {att}\n"

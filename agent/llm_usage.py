@@ -248,6 +248,29 @@ def _default_pricing_table() -> Dict[str, ModelPricing]:
         "claude-opus-4-5": ModelPricing(usd_per_1m_input=5.00, usd_per_1m_output=25.00),
         # Google Gemini — https://ai.google.dev/gemini-api/docs/pricing
         "gemini-flash-latest": ModelPricing(usd_per_1m_input=0.10, usd_per_1m_output=0.40),
+        # DeepSeek — https://api-docs.deepseek.com/quick_start/pricing
+        # Cached-input pricing = cache hit; non-cached input = "cache miss" rate.
+        # Refresh from agent/pricing.json after each provider price change.
+        "deepseek-v4-flash": ModelPricing(
+            usd_per_1m_input=0.14,
+            usd_per_1m_output=0.28,
+            usd_per_1m_cached_input=0.028,
+        ),
+        "deepseek-v4-pro": ModelPricing(
+            usd_per_1m_input=1.74,
+            usd_per_1m_output=3.48,
+            usd_per_1m_cached_input=0.145,
+        ),
+        "deepseek-chat": ModelPricing(
+            usd_per_1m_input=0.27,
+            usd_per_1m_output=1.10,
+            usd_per_1m_cached_input=0.07,
+        ),
+        "deepseek-reasoner": ModelPricing(
+            usd_per_1m_input=0.55,
+            usd_per_1m_output=2.19,
+            usd_per_1m_cached_input=0.14,
+        ),
         # Browser-Use — https://browser-use.com/changelog
         "bu-2-0": ModelPricing(usd_per_1m_input=0.60, usd_per_1m_output=3.50),
         "bu-1-0": ModelPricing(usd_per_1m_input=0.20, usd_per_1m_output=2.00),

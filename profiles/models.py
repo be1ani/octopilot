@@ -175,10 +175,17 @@ class Profile(BaseModel):
     base: BaseInfo
     other: OtherInfo = Field(default_factory=OtherInfo)
 
-    source_pdf_path: Optional[str] = None
-    resume_path: Optional[str] = Field(
+    source_pdf_path: Optional[str] = Field(
         default=None,
-        description="Resume PDF path (often under attachments/); used by the agent alongside source_pdf_path.",
+        description="Original PDF path the profile was extracted from. Audit-only; not used for runtime file resolution.",
+    )
+    attachments: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Documents uploaded by the user for this profile, stored under "
+            "`attachments/<profile_id>/`. Map of display-name -> repo-relative path. "
+            "The agent exposes every entry as an available file at runtime."
+        ),
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

@@ -417,7 +417,7 @@ export function MachineCard({
               </span>
             ) : null}
             {llmModel ? (
-              <span className="machine-version-pill machine-llm-pill" title="OpenAI model (ChatGPT)">
+              <span className="machine-version-pill machine-llm-pill" title="LLM model">
                 {llmModel}
               </span>
             ) : null}

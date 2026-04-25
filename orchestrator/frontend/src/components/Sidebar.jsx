@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import octoLogo from "../octo.svg";
-import { CHATGPT_MODEL_IDS, DEFAULT_CHATGPT_MODEL } from "../chatgptModels.js";
+import { LLM_MODEL_IDS, DEFAULT_LLM_MODEL } from "../chatgptModels.js";
 import "./Sidebar.css";
 
 export function Sidebar({
@@ -24,7 +24,7 @@ export function Sidebar({
   const [profileId, setProfileId] = useState("");
   const [profiles, setProfiles] = useState([]);
   const [profilesBusy, setProfilesBusy] = useState(false);
-  const [llmModel, setLlmModel] = useState(DEFAULT_CHATGPT_MODEL);
+  const [llmModel, setLlmModel] = useState(DEFAULT_LLM_MODEL);
   const [busy, setBusy] = useState(false);
   const [startModalOpen, setStartModalOpen] = useState(false);
   const [queueModelBusy, setQueueModelBusy] = useState(false);
@@ -49,9 +49,9 @@ export function Sidebar({
   };
 
   const queueModel = settings?.default_llm_model || "";
-  const queueModelOptions = queueModel && !CHATGPT_MODEL_IDS.includes(queueModel)
-    ? [queueModel, ...CHATGPT_MODEL_IDS]
-    : CHATGPT_MODEL_IDS;
+  const queueModelOptions = queueModel && !LLM_MODEL_IDS.includes(queueModel)
+    ? [queueModel, ...LLM_MODEL_IDS]
+    : LLM_MODEL_IDS;
 
   const maxParallel = Number(settings?.max_parallel_machines || 0);
   const activeCount = Number(stats?.machines_running || 0) + Number(stats?.machines_starting || 0);
@@ -163,14 +163,14 @@ export function Sidebar({
             </select>
           </label>
           <label className="modal-field">
-            <span>ChatGPT model (OpenAI)</span>
+            <span>LLM model</span>
             <select
               name="llm_model"
               value={llmModel}
               onChange={(e) => setLlmModel(e.target.value)}
-              aria-label="OpenAI ChatGPT model"
+              aria-label="LLM model"
             >
-              {CHATGPT_MODEL_IDS.map((id) => (
+              {LLM_MODEL_IDS.map((id) => (
                 <option key={id} value={id}>
                   {id}
                 </option>
@@ -266,7 +266,7 @@ export function Sidebar({
                     value={queueModel}
                     disabled={queueModelBusy}
                     onChange={(e) => onChangeQueueModel(e.target.value)}
-                    aria-label="Default ChatGPT model for queued jobs"
+                    aria-label="Default LLM model for queued jobs"
                   >
                     {queueModelOptions.map((id) => (
                       <option key={id} value={id}>
@@ -400,7 +400,7 @@ export function Sidebar({
                     value={queueModel}
                     disabled={queueModelBusy}
                     onChange={(e) => onChangeQueueModel(e.target.value)}
-                    aria-label="Default ChatGPT model for queued jobs"
+                    aria-label="Default LLM model for queued jobs"
                   >
                     {queueModelOptions.map((id) => (
                       <option key={id} value={id}>
