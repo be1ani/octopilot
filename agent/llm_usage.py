@@ -41,6 +41,8 @@ import logging
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -707,15 +709,39 @@ def _ledger_path() -> Optional[Path]:
     return Path(p) if p else None
 
 
-def append_ledger(row: Dict[str, Any], *, path: Optional[Path] = None) -> None:
+def _ledger_url() -> Optional[str]:
+    u = (os.getenv("AGENT_LLM_LEDGER_URL") or "").strip()
+    return u or None
+
+
+def _append_ledger_http(row: Dict[str, Any], *, url: str, timeout_s: float = 2.0) -> None:
+    data = json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310 - internal URL
+        # Drain the response to keep urllib happy; ignore body.
+        _ = resp.read()
+
+
+def append_ledger(row: Dict[str, Any], *, path: Optional[Path] = None, url: Optional[str] = None) -> None:
     """
-    Append a single JSONL row to the ledger. Safe under concurrent threads;
-    multi-process callers should run behind an OS-level lock if needed.
+    Append a single ledger row.
+
+    When ``AGENT_LLM_LEDGER_URL`` is set, posts the row to that endpoint.
+    Otherwise, when ``AGENT_LLM_LEDGER_PATH`` is set, appends JSONL locally.
     """
-    p = path or _ledger_path()
-    if p is None:
-        return
     try:
+        u = url or _ledger_url()
+        if u:
+            _append_ledger_http(row, url=u)
+            return
+        p = path or _ledger_path()
+        if p is None:
+            return
         p.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
         with _LEDGER_LOCK:
@@ -755,6 +781,7 @@ class LLMUsageRecorder:
     def __init__(self, *, ledger_path: Optional[str | Path] = None) -> None:
         self._by_key: Dict[Tuple[str, str, str], _Slot] = {}
         self._ledger_path: Optional[Path] = Path(ledger_path) if ledger_path else _ledger_path()
+        self._ledger_url: Optional[str] = _ledger_url()
         self._lock = threading.Lock()
 
     # --- aggregation ------------------------------------------------------
@@ -793,7 +820,7 @@ class LLMUsageRecorder:
             slot.usage.add(usage.normalized())
             slot.calls += 1
 
-        if ledger_meta is not None and self._ledger_path is not None:
+        if ledger_meta is not None and (self._ledger_url is not None or self._ledger_path is not None):
             cost = estimate_cost_usd(model=model, usage=usage, tier=tier)
             row: Dict[str, Any] = {
                 "ts": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -804,7 +831,7 @@ class LLMUsageRecorder:
                 "cost_usd": None if cost is None else round(float(cost), 8),
             }
             row.update({k: v for k, v in ledger_meta.items() if k not in row})
-            append_ledger(row, path=self._ledger_path)
+            append_ledger(row, path=self._ledger_path, url=self._ledger_url)
 
     def record_call(
         self,

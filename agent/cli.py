@@ -310,9 +310,9 @@ def _make_agent_llm() -> Any:
 
     if provider == "deepseek":
         # DeepSeek exposes an OpenAI-compatible /chat/completions endpoint.
-        # browser-use ships a dedicated wrapper; importing from the submodule
-        # because `ChatDeepSeek` is not re-exported at the package root.
-        from browser_use.llm.deepseek.chat import ChatDeepSeek
+        # Octopilot uses a thin subclass: `deepseek-reasoner` rejects OpenAI's forced
+        # `tool_choice` (see agent/compat_chat_deepseek.py).
+        from agent.compat_chat_deepseek import OctopilotChatDeepSeek
 
         api_key = os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
@@ -325,7 +325,7 @@ def _make_agent_llm() -> Any:
         base_url = (os.getenv("DEEPSEEK_BASE_URL") or "").strip()
         if base_url:
             kwargs["base_url"] = base_url
-        return ChatDeepSeek(**kwargs)
+        return OctopilotChatDeepSeek(**kwargs)
 
     raise SystemExit(
         f"Unknown AGENT_LLM_PROVIDER={provider!r}. "

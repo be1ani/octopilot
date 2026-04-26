@@ -203,41 +203,32 @@ def _read_terminal_log(mid: str) -> tuple[str, bool, int]:
 
 def append_application_record(record: dict[str, Any]) -> None:
     """
-    Append a single JSONL record.
-    Best-effort durable: fsync after write.
+    Persist a single application record.
     """
-    p = _applications_path()
-    line = json.dumps(record, ensure_ascii=False)
-    with p.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except Exception:
-            pass
+    try:
+        coll = _applications_coll()
+        doc = dict(record or {})
+        # Ensure id exists so updates can target it.
+        if "id" not in doc or not str(doc.get("id") or "").strip():
+            doc["id"] = str(uuid.uuid4())
+        # Normalize ts for sorting.
+        if "ts" not in doc and isinstance(doc.get("created_at"), (int, float)):
+            doc["ts"] = float(doc["created_at"])
+        if "ts" not in doc:
+            doc["ts"] = time.time()
+        coll.update_one({"id": doc["id"]}, {"$set": doc}, upsert=True)
+    except PyMongoError:
+        # Best-effort: app records should never crash the main loop.
+        return
 
 
 def read_application_records(limit: int = 500) -> list[dict[str, Any]]:
-    p = _applications_path()
-    if not p.is_file():
-        return []
     try:
-        raw_lines = p.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        coll = _applications_coll()
+        cur = coll.find({}, {"_id": 0}).sort([("ts", -1)]).limit(max(1, int(limit or 500)))
+        return [doc for doc in cur if isinstance(doc, dict)]
+    except PyMongoError:
         return []
-    out: list[dict[str, Any]] = []
-    # Read from end (newest first)
-    for line in reversed(raw_lines[-max(1, limit) :]):
-        s = (line or "").strip()
-        if not s:
-            continue
-        try:
-            obj = json.loads(s)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            out.append(obj)
-    return out
 
 
 _applications_lock = threading.RLock()
@@ -246,6 +237,47 @@ _applications_lock = threading.RLock()
 _profiles_lock = threading.RLock()
 _mongo_lock = threading.RLock()
 _mongo_client: MongoClient | None = None
+
+
+def _orch_state_collection_name() -> str:
+    return (os.environ.get("ORCH_STATE_COLLECTION") or "").strip() or "orch_state"
+
+
+def _orch_applications_collection_name() -> str:
+    return (os.environ.get("ORCH_APPLICATIONS_COLLECTION") or "").strip() or "applications"
+
+
+def _orch_llm_ledger_collection_name() -> str:
+    return (os.environ.get("ORCH_LLM_LEDGER_COLLECTION") or "").strip() or "llm_ledger"
+
+
+def _state_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    return db[_orch_state_collection_name()]
+
+
+def _applications_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    coll = db[_orch_applications_collection_name()]
+    try:
+        coll.create_index([("id", 1)], unique=True, name="app_id_unique")
+        coll.create_index([("ts", -1)], name="ts_desc")
+        coll.create_index([("machine_id", 1), ("ts", -1)], name="machine_ts")
+    except PyMongoError:
+        pass
+    return coll
+
+
+def _llm_ledger_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    coll = db[_orch_llm_ledger_collection_name()]
+    try:
+        coll.create_index([("ts", -1)], name="ts_desc")
+        coll.create_index([("machine_id", 1), ("ts", -1)], name="machine_ts")
+        coll.create_index([("model", 1), ("ts", -1)], name="model_ts")
+    except PyMongoError:
+        pass
+    return coll
 
 
 def _orch_mongo_uri() -> str:
@@ -763,60 +795,41 @@ def update_application_record(
 ) -> dict[str, Any] | None:
     """
     Apply a shallow patch to the first matching application record (by id) and
-    rewrite the JSONL file atomically. Returns the merged record, or None if not
-    found. Unknown / protected keys are dropped by the caller.
+    persist it in Mongo. Returns the merged record, or None if not found.
+    Unknown / protected keys are dropped by the caller.
     """
-    p = _applications_path()
-    if not p.is_file():
+    try:
+        coll = _applications_coll()
+        doc = coll.find_one({"id": app_id}, {"_id": 0})
+        if not isinstance(doc, dict):
+            return None
+        merged = dict(doc)
+        merged.update(patch or {})
+        coll.update_one({"id": app_id}, {"$set": patch or {}}, upsert=False)
+        return merged
+    except PyMongoError:
         return None
-    with _applications_lock:
-        try:
-            raw_lines = p.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return None
-        updated: dict[str, Any] | None = None
-        new_lines: list[str] = []
-        for line in raw_lines:
-            s = (line or "").strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                new_lines.append(s)
-                continue
-            if isinstance(obj, dict) and obj.get("id") == app_id and updated is None:
-                obj.update(patch)
-                updated = obj
-                new_lines.append(json.dumps(obj, ensure_ascii=False))
-                continue
-            new_lines.append(json.dumps(obj, ensure_ascii=False) if isinstance(obj, dict) else s)
-        if updated is None:
-            return None
-        tmp = p.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-        tmp.replace(p)
-        return updated
 
 
 def load_state() -> dict[str, Any]:
-    p = _state_path()
-    if not p.is_file():
-        return {"machines": [], "total_applications_submitted": 0, "ledger_overrides": {}}
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and "ledger_overrides" not in data:
-            data["ledger_overrides"] = {}
-        return data if isinstance(data, dict) else {"machines": [], "total_applications_submitted": 0, "ledger_overrides": {}}
-    except (OSError, json.JSONDecodeError):
+        coll = _state_coll()
+        doc = coll.find_one({"_id": "orchestrator_state"}, {"_id": 0})
+        if not isinstance(doc, dict):
+            return {"machines": [], "total_applications_submitted": 0, "ledger_overrides": {}}
+        if "ledger_overrides" not in doc:
+            doc["ledger_overrides"] = {}
+        return doc
+    except PyMongoError:
         return {"machines": [], "total_applications_submitted": 0, "ledger_overrides": {}}
 
 
 def save_state(data: dict[str, Any]) -> None:
-    p = _state_path()
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    try:
+        coll = _state_coll()
+        coll.update_one({"_id": "orchestrator_state"}, {"$set": dict(data or {})}, upsert=True)
+    except PyMongoError:
+        return
 
 
 def _tail_lines(path: Path, *, max_lines: int = 200, max_bytes: int = 2_000_000) -> list[str]:
@@ -1825,9 +1838,8 @@ def reconcile_openai_usage():
         settings = _get_settings(data)
         ledger_rel = ledger_rel or (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL)
 
-    ledger_check, _ledger_mount = _mountable_paths(ledger_rel)
-    if not ledger_check.is_file():
-        return jsonify({"error": f"Ledger not found at {ledger_check} (configure llm_ledger_relpath)."}), 400
+    # Ledger is now stored in Mongo; the reconcile script expects a JSONL file.
+    return jsonify({"error": "OpenAI reconcile expects a JSONL ledger file; ledger is stored in Mongo in this setup."}), 400
 
     env = dict(os.environ)
     env["OPENAI_ADMIN_KEY"] = admin_key
@@ -1858,7 +1870,7 @@ def reconcile_openai_usage():
 @app.get("/api/ledger")
 def get_ledger():
     """
-    Return tail of the LLM ledger (JSONL) along with any saved overrides.
+    Return recent LLM ledger rows (Mongo) along with any saved overrides.
 
     Query params:
       limit=<int> (default 200, max 2000)
@@ -1874,30 +1886,21 @@ def get_ledger():
         settings = _get_settings(data)
         ledger_rel = (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL).strip()
         overrides = data.get("ledger_overrides") if isinstance(data.get("ledger_overrides"), dict) else {}
-
-    ledger_path, _mnt = _mountable_paths(ledger_rel)
-    if not ledger_path.is_file():
-        return jsonify({"error": f"Ledger not found at {ledger_path}"}), 404
-
-    rows: list[dict[str, Any]] = []
-    for line in _tail_lines(ledger_path, max_lines=limit):
-        s = (line or "").strip()
-        if not s:
-            continue
-        try:
-            obj = json.loads(s)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        rid = str(obj.get("request_id") or obj.get("id") or "").strip()
-        ov = overrides.get(rid) if rid and isinstance(overrides, dict) else None
-        if isinstance(ov, dict):
-            obj = dict(obj)
-            obj["override"] = ov
-        rows.append(obj)
-
-    return jsonify({"ledger_relpath": ledger_rel, "rows": rows})
+    try:
+        cur = _llm_ledger_coll().find({}, {"_id": 0}).sort([("ts_unix", -1)]).limit(limit)
+        rows: list[dict[str, Any]] = []
+        for obj in cur:
+            if not isinstance(obj, dict):
+                continue
+            rid = str(obj.get("request_id") or obj.get("id") or "").strip()
+            ov = overrides.get(rid) if rid and isinstance(overrides, dict) else None
+            if isinstance(ov, dict):
+                obj = dict(obj)
+                obj["override"] = ov
+            rows.append(obj)
+        return jsonify({"ledger_relpath": ledger_rel, "rows": rows})
+    except PyMongoError:
+        return jsonify({"error": "Failed to read ledger"}), 500
 
 
 @app.patch("/api/ledger/overrides")
@@ -2060,11 +2063,6 @@ def _spawn_machine_row(
         data_for_settings = load_state()
         settings = _get_settings(data_for_settings)
     pricing_overrides = settings.get("llm_pricing_overrides")
-    ledger_rel = (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL).strip()
-    ledger_host_check, ledger_host_mount = _mountable_paths(ledger_rel)
-    if ledger_rel:
-        ledger_host_check.parent.mkdir(parents=True, exist_ok=True)
-        ledger_host_check.touch(exist_ok=True)
     llm_env_args = _llm_provider_env_args()
 
     cmd = [
@@ -2092,9 +2090,8 @@ def _spawn_machine_row(
         "ORCH_API_BASE=http://host.docker.internal:5050",
     ]
     cmd.extend(_agent_runtime_env_for_model(llm_model))
-    if ledger_rel:
-        cmd.extend(["-v", f"{ledger_host_mount}:/app/llm_ledger.jsonl"])
-        cmd.extend(["-e", "AGENT_LLM_LEDGER_PATH=/app/llm_ledger.jsonl"])
+    # LLM ledger is stored in Mongo via the orchestrator API (no on-disk JSONL file).
+    cmd.extend(["-e", "AGENT_LLM_LEDGER_URL=http://host.docker.internal:5050/api/llm-ledger/append"])
     if isinstance(pricing_overrides, dict) and pricing_overrides:
         cmd.extend(["-e", f"AGENT_LLM_PRICING_JSON={json.dumps(pricing_overrides)}"])
     cmd.extend(llm_env_args)
@@ -2369,13 +2366,8 @@ def restart_machine(mid: str):
         # Inject pricing overrides + ledger path (same as initial spawn).
         settings = _get_settings(data)
         pricing_overrides = settings.get("llm_pricing_overrides")
-        ledger_rel = (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL).strip()
-        if ledger_rel:
-            ledger_host_check, ledger_host_mount = _mountable_paths(ledger_rel)
-            ledger_host_check.parent.mkdir(parents=True, exist_ok=True)
-            ledger_host_check.touch(exist_ok=True)
-            cmd.extend(["-v", f"{ledger_host_mount}:/app/llm_ledger.jsonl"])
-            cmd.extend(["-e", "AGENT_LLM_LEDGER_PATH=/app/llm_ledger.jsonl"])
+        # LLM ledger is stored in Mongo via the orchestrator API (no on-disk JSONL file).
+        cmd.extend(["-e", "AGENT_LLM_LEDGER_URL=http://host.docker.internal:5050/api/llm-ledger/append"])
         if isinstance(pricing_overrides, dict) and pricing_overrides:
             cmd.extend(["-e", f"AGENT_LLM_PRICING_JSON={json.dumps(pricing_overrides)}"])
         cmd.extend(llm_env_args)
@@ -2771,6 +2763,27 @@ def list_applications():
         limit = 200
     limit = max(1, min(limit, 2000))
     return jsonify(read_application_records(limit=limit))
+
+
+@app.post("/api/llm-ledger/append")
+def append_llm_ledger_row():
+    """
+    Append a single LLM usage ledger row (JSON object) into Mongo.
+
+    The agent calls this endpoint when AGENT_LLM_LEDGER_URL is set.
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "expected a JSON object"}), 400
+    doc = dict(body)
+    # Add a server timestamp (seconds) for sorting even if caller omitted it.
+    if "ts_unix" not in doc:
+        doc["ts_unix"] = time.time()
+    try:
+        _llm_ledger_coll().insert_one(doc)
+        return jsonify({"ok": True})
+    except PyMongoError:
+        return jsonify({"error": "Failed to append ledger row"}), 500
 
 
 @app.get("/api/profiles")
