@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import copy
 import inspect
 import json
 import os
@@ -16,7 +17,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from profiles.profiler import Profiler, ResolveDocumentsParams, ResolveFieldsParams, FieldRequest
+from profiles.profiler import (
+    AskUserMissingInfoParams,
+    FieldRequest,
+    FieldUiSpec,
+    Profiler,
+    ResolveDocumentsParams,
+    ResolveFieldsParams,
+)
 from .agent_control import TakeoverRequested, get_default as _get_agent_control
 from .llm_usage import LLMUsageRecorder, TokenTrackingLLM
 
@@ -517,6 +525,40 @@ def _deep_set(obj: dict[str, Any], path: str, value: Any) -> None:
     cur[parts[-1]] = value
 
 
+def _profile_scalar_from_base_or_custom(profile: dict[str, Any], path: str) -> Any:
+    """Read a dotted path from typed `base` first, then from custom relative/absolute maps."""
+    v = _deep_get(profile, path)
+    if v not in (None, ""):
+        return v
+    try:
+        custom = profile.get("other", {}).get("custom", {})
+        if not isinstance(custom, dict):
+            return None
+        abs_m = custom.get("absolute_fields")
+        rel = custom.get("relative_fields")
+        if isinstance(abs_m, dict) and path in abs_m and abs_m[path] not in (None, ""):
+            return abs_m[path]
+        if isinstance(rel, dict) and path in rel and rel[path] not in (None, ""):
+            return rel[path]
+    except Exception:
+        return None
+    return None
+
+
+def _store_base_scalar_in_custom(profile: dict[str, Any], path: str, value: str) -> None:
+    """Persist `base.*` scalars under `other.custom.relative_fields` only (no `profile['base']` writes)."""
+    other = profile.setdefault("other", {})
+    custom = other.setdefault("custom", {})
+    if not isinstance(custom, dict):
+        other["custom"] = {}
+        custom = other["custom"]
+    rel = custom.setdefault("relative_fields", {})
+    if not isinstance(rel, dict):
+        custom["relative_fields"] = {}
+        rel = custom["relative_fields"]
+    rel[path] = value
+
+
 def _input_with_periodic_bell(prompt: str) -> str:
     """
     Block for user input.
@@ -615,6 +657,35 @@ def _prompt_yes_no(prompt: str, default_no: bool = True) -> bool:
     return val in {"y", "yes"}
 
 
+def _confirm_before_submit_interactive(prompt: str) -> bool:
+    """Orchestrator UI when ORCH_* is configured; otherwise terminal Enter-to-confirm."""
+    try:
+        from agent.orch_human_input import human_input_backend, wait_confirm
+
+        if human_input_backend() == "orch":
+            return wait_confirm(action_description=prompt)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    return _prompt_enter_to_confirm(prompt)
+
+
+def _human_checkpoint_sync(*, orch_message: str, terminal_banner: str, terminal_prompt: str) -> None:
+    try:
+        from agent.orch_human_input import human_input_backend, wait_captcha_continue
+
+        if human_input_backend() == "orch":
+            wait_captcha_continue(message=orch_message)
+            return
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    print(terminal_banner)
+    _input_with_periodic_bell(terminal_prompt)
+
+
 def _prompt_enter_to_confirm(prompt: str) -> bool:
     """
     Enter-to-confirm prompt used for the submit/continue confirmation step.
@@ -675,15 +746,49 @@ def _ensure_minimum_profile_fields(profile: dict[str, Any]) -> dict[str, Any]:
     Ensure common required fields are present. The agent can still ask for
     additional missing info during the run via the interactive tool.
     """
+    from agent.orch_human_input import (
+        extract_scalar_value,
+        human_input_backend,
+        new_request_id,
+        wait_human_response,
+    )
+
     required_paths = [
         ("base.full_name", "Full name"),
         ("base.email", "Email"),
         ("base.phone", "Phone"),
     ]
     for path, label in required_paths:
-        cur = _deep_get(profile, path)
+        cur = _profile_scalar_from_base_or_custom(profile, path)
         if not cur:
-            _deep_set(profile, path, _prompt_nonempty(f"Missing profile field: {label}"))
+            if human_input_backend() == "orch":
+                rid = new_request_id()
+                pl = path.lower()
+                sensitive = "email" in pl or "phone" in pl
+                resp = wait_human_response(
+                    request_id=rid,
+                    kind="field",
+                    item={
+                        "field_key": path,
+                        "display_name": label,
+                        "help_text": f"Required profile field missing: {label}",
+                        "value_kind": "text",
+                        "default_value": None,
+                        "options": None,
+                        "sensitive": sensitive,
+                        "validation": {"required": True},
+                        "show_promote_to_absolute": False,
+                    },
+                    attention_reason=f"profile: {label}",
+                )
+                val = extract_scalar_value(resp)
+                if val is None or str(val).strip() == "":
+                    raise SystemExit(f"Missing required profile field: {label}")
+                _store_base_scalar_in_custom(profile, path, str(val).strip())
+            else:
+                _store_base_scalar_in_custom(
+                    profile, path, _prompt_nonempty(f"Missing profile field: {label}")
+                )
     return profile
 
 
@@ -708,12 +813,43 @@ def _compact_profile_for_prompt(profile: dict[str, Any]) -> dict[str, Any]:
     return clean(profile) or {}
 
 
+def _profile_for_prompt_without_relative_fields(profile: dict[str, Any]) -> dict[str, Any]:
+    """
+    Copy of the profile for the initial task text only.
+
+    Job-dependent values live under `other.custom.relative_fields`; omit that
+    bucket here so the model does not treat cached answers as authoritative
+    before `resolve_fields` confirms them for this application.
+
+    Applicant scalars stored only under custom maps as `base.*` keys are copied
+    onto the prompt copy's typed `base` object (ephemeral — not a DB write).
+    """
+    p = copy.deepcopy(profile)
+    other = p.get("other")
+    if isinstance(other, dict):
+        custom = other.get("custom")
+        if isinstance(custom, dict):
+            for bucket in ("relative_fields", "absolute_fields"):
+                bmap = custom.get(bucket)
+                if not isinstance(bmap, dict):
+                    continue
+                for k, v in list(bmap.items()):
+                    if isinstance(k, str) and k.startswith("base.") and v not in (None, ""):
+                        _deep_set(p, k, v)
+                        del bmap[k]
+            if "relative_fields" in custom:
+                del custom["relative_fields"]
+    return p
+
+
 def _build_task(job_url: str, profile: dict[str, Any]) -> str:
     """
     The *first* message must contain the profile object (per user request).
     """
     profile_json = json.dumps(
-        _compact_profile_for_prompt(profile), ensure_ascii=False, indent=2
+        _compact_profile_for_prompt(_profile_for_prompt_without_relative_fields(profile)),
+        ensure_ascii=False,
+        indent=2,
     )
     return (
         "You are an expert job application assistant.\n"
@@ -758,6 +894,10 @@ def _build_task(job_url: str, profile: dict[str, Any]) -> str:
         "- `ask_user_for_missing_info` RESPONSE: read the returned JSON ({key: value}) and fill the form with that value.\n"
         "  NEVER call `ask_user_for_missing_info` twice for the same field — the tool already returned the confirmed value.\n"
         "  If you cannot find a value in the response, use `resolve_fields` (which also returns the cached value for known keys).\n"
+        "- Human input UI (orchestrator): for `ask_user_for_missing_info` and each entry in `resolve_fields.fields`, you MUST\n"
+        "  include `ui` with `display_name` (normalized label), `value_kind` (text|number|date|multiline|single_select|\n"
+        "  multi_select|boolean|file_path), optional `options` [{value,label}] for selects, `sensitive` for secrets,\n"
+        "  and optional `validation` {pattern, min, max, required}. Use `file_path` for document paths.\n"
         "- Extra/Other document uploads:\n"
         "  - If an upload field is required and labeled generically (e.g. 'Other', 'Other documents', 'Additional documents')\n"
         "    and the form does NOT explicitly specify which document is needed, FIRST read the whole form.\n"
@@ -779,6 +919,21 @@ def _build_task(job_url: str, profile: dict[str, Any]) -> str:
         "  If it fails ~10 times, ask the user to intervene.\n"
         "- If you are struggling to perform any task (e.g., repeated retries, can't find an element, blocked by UI state),\n"
         "  call `request_user_intervention` describing what you need the user to do in the browser.\n"
+        "- FORM FILLING / SHADOW DOM (avoid re-filling the same fields in a loop):\n"
+        "  - Many application forms render inputs inside **closed or nested Shadow DOM**. Scripts that use "
+        "`document.getElementById`, `querySelector` on the **page root**, or light-DOM IDs often see **no elements** "
+        "or **empty values** even when fields are visible in the browser snapshot and the **`input` action succeeded**.\n"
+        "  - Therefore: if **`input` returned success** for an index, **assume the value was applied** and **do not** call "
+        "`input` again with the **same element index** and the **same text** in this run, unless the URL changed, the step "
+        "reset the form, or a **snapshot/extract** clearly shows that specific field is blank.\n"
+        "  - **Never** conclude \"all fields are empty\" solely from an `evaluate` script that walks normal DOM IDs — that "
+        "false negative triggers useless repeat fills. Prefer **`extract`** (e.g. \"What text appears in the first name / "
+        "Vorname field?\") or the **current interactive snapshot**, not `getElementById('field-firstName')`-style checks.\n"
+        "  - After filling a batch of text fields once successfully, **move on** to dropdowns, checkboxes, uploads, and "
+        "`resolve_fields` — do **not** chain multiple `wait` steps only to \"verify\" via broken DOM queries, then re-type "
+        "the same data.\n"
+        "  - If stuck between contradictory signals (input says OK, evaluate says empty), treat it as **Shadow DOM mismatch**: "
+        "continue the workflow; use `request_user_intervention` only if you cannot operate a required control at all.\n"
         "- DROPDOWNS / SELECT / custom option lists (country, city, etc.):\n"
         "  - Element indices in the browser snapshot are volatile: after any scroll, wait, failed click, or DOM update, "
         "they may change. Do not reuse an index from an earlier step; refresh your picture of the page first.\n"
@@ -789,16 +944,11 @@ def _build_task(job_url: str, profile: dict[str, Any]) -> str:
         "not a generic container that might map to the first item (wrong option).\n"
         "  - Virtualized / long lists: scroll **inside the dropdown’s scrollable panel** (pass that element’s index to "
         "`scroll`), not only the main page, until the target label appears in the list you will click.\n"
-        "  - Do not trust `search_page` alone for text inside overlays or virtualized lists — it may return 0 matches "
-        "while the option is still visible in the open dropdown. Rely on list-focused `find_elements` / `extract` instead.\n"
-        "  - After each unsuccessful attempt (wrong value still shown, wrong row clicked, or \"element index not available\"), "
-        "you MUST call `dropdown_selection_failed(field_label, intended_option_text, ...)` once before retrying.\n"
-        "  - MANDATORY verification: after every `click` on a dropdown row/option, read the tool result. If it says you "
-        "clicked a different label than your target (e.g. target 'Deutschland' but result shows `Clicked li \"Argentinien\"`), "
-        "call `dropdown_selection_failed` in the **same** step before any further actions — do not keep clicking other rows.\n"
-        "  - On **every** failed dropdown attempt (wrong value shown, wrong row clicked, stale/unavailable element index, or "
-        "you cannot confirm the control shows the intended option), call `dropdown_selection_failed` once. The run will "
-        "**immediately** pause for the user to set that dropdown manually, then you continue.\n"
+        "  - After every click on an option, verify the control now shows the intended value (read the tool result and/or "
+        "use `extract`). If it shows a different label, retry with the correct row.\n"
+        "  - If a dropdown still cannot be set after a few honest retries (e.g. shadow-DOM widget you cannot operate, "
+        "options never appear, control keeps reverting), call `request_user_intervention` and ask the user to set that "
+        "single control in the browser — then resume.\n"
         "- When interacting with CHECKBOXES: after clicking, verify it is actually checked (look for a checked state, aria-checked=true, or UI change).\n"
         "  If the checkbox did not toggle, do NOT keep clicking the outer container.\n"
         "  Instead click the core element: the actual <input type=\"checkbox\"> or the innermost div/span with role=\"checkbox\".\n"
@@ -811,103 +961,6 @@ def _build_task(job_url: str, profile: dict[str, Any]) -> str:
         "  Until then, avoid submits that would only fail on CAPTCHA — fill everything else first.\n"
         "- Prefer filling fields first; only submit when all required fields are satisfied.\n"
     )
-
-
-_CLICKED_LI_RE = re.compile(r'Clicked li ["\']([^"\']+)["\']', re.IGNORECASE)
-
-
-def _action_results_text_blob(results: Any) -> str:
-    parts: list[str] = []
-    for r in results or []:
-        for attr in ("extracted_content", "long_term_memory", "error"):
-            v = getattr(r, attr, None)
-            if isinstance(v, str) and v.strip():
-                parts.append(v)
-    return "\n".join(parts)
-
-
-def _clicked_li_labels_from_results(results: Any) -> list[str]:
-    return _CLICKED_LI_RE.findall(_action_results_text_blob(results))
-
-
-def _quoted_targets_ordered_from_text(text: str) -> list[str]:
-    """
-    Pull quoted tokens in source order (common in next_goal: select 'Deutschland' ... 'Hamburg').
-    Filters very short tokens and common English filler words.
-    """
-    if not (text and text.strip()):
-        return []
-    skip = {
-        "the",
-        "and",
-        "then",
-        "click",
-        "select",
-        "open",
-        "close",
-        "wait",
-        "scroll",
-        "first",
-        "next",
-        "same",
-        "visible",
-        "exact",
-        "inner",
-        "list",
-        "row",
-        "option",
-        "field",
-        "form",
-        # Common button / chrome labels (not option values)
-        "auswählen",
-        "weiter",
-        "absenden",
-        "bewerben",
-        "submit",
-        "apply",
-        "choose",
-        "cancel",
-        "ok",
-    }
-    out: list[str] = []
-    for m in re.finditer(r"'([^']{2,80})'|\"([^\"]{2,80})\"", text):
-        t = (m.group(1) or m.group(2) or "").strip()
-        if len(t) < 2 or t.lower() in skip:
-            continue
-        out.append(t)
-    return out
-
-
-def _dropdown_option_texts_equivalent(a: str, b: str) -> bool:
-    na = re.sub(r"\s+", " ", a.strip().lower())
-    nb = re.sub(r"\s+", " ", b.strip().lower())
-    if na == nb:
-        return True
-    germany = frozenset({"germany", "deutschland", "de"})
-    if na in germany and nb in germany:
-        return True
-    uk = frozenset({"uk", "united kingdom", "great britain", "gb"})
-    if na in uk and nb in uk:
-        return True
-    return False
-
-
-def _infer_dropdown_field_label(
-    intended: str,
-    *,
-    resolved_fields: dict[str, Any],
-    profile_fields: dict[str, Any],
-) -> str:
-    """Best-effort label for failure accounting / UI messaging."""
-    for key in ("country",):
-        v = resolved_fields.get(key) or profile_fields.get(key)
-        if isinstance(v, str) and v.strip() and _dropdown_option_texts_equivalent(intended, v):
-            return "Land* (Country)"
-    for key in ("desired_location",):
-        v = resolved_fields.get(key) or profile_fields.get(key)
-        if isinstance(v, str) and v.strip() and _dropdown_option_texts_equivalent(intended, v):
-            return "Wunschstandort* (Preferred Location)"
-    return "Dropdown"
 
 
 def _attachments_dir() -> Path | None:
@@ -1364,25 +1417,37 @@ async def _run(
         print(description)
         return 2
 
-    # Count identical field_path calls to `ask_user_for_missing_info` so we can
-    # escalate / hard-stop loops instead of replaying the same prompt forever.
-    ask_counter: dict[str, int] = {}
-    _ASK_ESCALATE_AT = int(os.getenv("AGENT_ASK_ESCALATE_AT", "2") or 2)
-
     @tools.action(
         description=(
             "Ask the user for a single missing value. Returns the value (as JSON {key: value}) so you "
             "can fill it into the form immediately. If this field was already answered earlier in this run, "
-            "it returns the cached value instead of re-prompting. Call this at most a couple of times per "
-            "field — repeated calls for the same field will escalate to a manual browser intervention."
-        )
+            "it returns the cached value instead of re-prompting. "
+            "You MUST pass `ui` with display_name, value_kind (text|number|date|multiline|single_select|"
+            "multi_select|boolean|file_path), optional options for selects, sensitive=true for secrets, "
+            "and validation hints (pattern/min/max)."
+        ),
+        param_model=AskUserMissingInfoParams,
     )
-    def ask_user_for_missing_info(field_path: str, question: str) -> str:
+    def ask_user_for_missing_info(params: AskUserMissingInfoParams) -> str:
+        field_path = params.field_path
+        question = params.question
         key = (field_path or "").strip() or "<unknown>"
-        ask_counter[key] = ask_counter.get(key, 0) + 1
 
+        spec_ui = params.ui or FieldUiSpec(
+            display_name=key,
+            value_kind="multiline",
+            help_text=question,
+        )
         req = ResolveFieldsParams(
-            fields=[FieldRequest(key=field_path, label=field_path, prompt=question, default=None)]
+            fields=[
+                FieldRequest(
+                    key=field_path,
+                    label=field_path,
+                    prompt=question,
+                    default=None,
+                    ui=spec_ui,
+                )
+            ]
         )
         raw = profiler.resolve_fields(req)
 
@@ -1398,23 +1463,6 @@ async def _run(
         if isinstance(parsed, dict):
             value = parsed.get(key)
 
-        # Hard-stop loop: if the agent keeps asking for the same field many times,
-        # pause for the user to fix it in the browser (same UX as dropdown_selection_failed).
-        if ask_counter[key] >= _ASK_ESCALATE_AT:
-            known = f" (already resolved this run: {value!r})" if value not in (None, "") else ""
-            _record_dropdown_failure(
-                field_path,
-                str(value) if value not in (None, "") else "<unknown>",
-                (
-                    f"ask_user_for_missing_info was called {ask_counter[key]} times for the same field "
-                    f"{field_path!r}{known}. The agent appears to be stuck; the user is being asked to "
-                    "set this control manually in the browser."
-                ),
-            )
-            # Reset the counter so one manual fix per field doesn't immediately re-trigger.
-            ask_counter[key] = 0
-
-        # Always return the JSON so the agent can see the value and act on it.
         if value not in (None, ""):
             return (
                 f"{raw}\n"
@@ -1471,12 +1519,21 @@ async def _run(
                 state = None
 
             if state is not None and _browser_state_suggests_captcha(state):
-                print(
+                orch_msg = (
+                    "CAPTCHA or human verification was detected in the browser. "
+                    "Solve it in the VNC window, then press Continue in the Input tab to proceed with submission."
+                )
+                term_banner = (
                     "\nCAPTCHA / human verification detected.\n"
                     "Please solve it in the browser window now (this is the last step before submit).\n"
                     "When done, press Enter here to continue with submission.\n"
                 )
-                _input_with_periodic_bell("\n\033[1;33mPress Enter to continue...\033[0m ")
+                await asyncio.to_thread(
+                    _human_checkpoint_sync,
+                    orch_message=orch_msg,
+                    terminal_banner=term_banner,
+                    terminal_prompt="\n\033[1;33mPress Enter to continue...\033[0m ",
+                )
 
         # Track repeated attempts for the same submit/continue action.
         page_url = None
@@ -1493,14 +1550,21 @@ async def _run(
 
         # Ask for confirmation only once per action; subsequent retries should not re-prompt.
         if not submit_confirmed_once.get(key, False):
-            ok = _prompt_enter_to_confirm(f"Confirm: {action_description}")
+            ok = await asyncio.to_thread(
+                _confirm_before_submit_interactive,
+                f"Confirm: {action_description}",
+            )
             if not ok:
                 raise InterruptedError("User declined confirmation.")
             submit_confirmed_once[key] = True
 
         # If it keeps failing, require user intervention (but do not ask confirmation again).
         if submit_guard[key] >= 10:
-            print(
+            orch_msg = (
+                "Submission failed many times. Fix the form or CAPTCHA in the VNC window, "
+                "then press Continue in the Input tab so the agent can retry."
+            )
+            term_banner = (
                 "\n\033[1;31mSubmission appears to be failing repeatedly (10+ attempts).\033[0m\n"
                 "Please intervene manually in the browser window:\n"
                 "- If submit is disabled, look for missing/incorrect fields\n"
@@ -1509,7 +1573,12 @@ async def _run(
                 "- Solve CAPTCHA if present\n"
                 "Then press Enter to let the agent retry.\n"
             )
-            _input_with_periodic_bell("\n\033[1;33mPress Enter to continue...\033[0m ")
+            await asyncio.to_thread(
+                _human_checkpoint_sync,
+                orch_message=orch_msg,
+                terminal_banner=term_banner,
+                terminal_prompt="\n\033[1;33mPress Enter to continue...\033[0m ",
+            )
             submit_guard[key] = 0
 
         return "Confirmed."
@@ -1619,36 +1688,6 @@ async def _run(
         registered.function = guarded_done  # type: ignore[assignment]
 
     _install_done_guard()
-
-    def _record_dropdown_failure(
-        field_label: str,
-        intended_option_text: str,
-        what_happened: str | None = None,
-    ) -> str:
-        extra = f" Detail: {what_happened}" if what_happened and what_happened.strip() else ""
-        print(
-            f"\n\033[1;31mDropdown intervention required for {field_label!r} → {intended_option_text!r}.{extra}\033[0m\n"
-            "Please set this control to the intended value in the browser window, then press Enter here to resume.\n"
-        )
-        _input_with_periodic_bell("\n\033[1;33mPress Enter to continue...\033[0m ")
-        return (
-            "Manual selection assumed complete. Re-read the page to confirm the control shows the intended value, "
-            "then continue. If another dropdown fails, call `dropdown_selection_failed` again."
-        )
-
-    @tools.action(
-        description=(
-            "Record a failed attempt to set a dropdown/select to the intended option (wrong row, wrong value still shown, "
-            "or stale/unavailable index). The run immediately pauses so the user can set this control manually, then you "
-            "continue. Call once per failed attempt for that field."
-        )
-    )
-    def dropdown_selection_failed(
-        field_label: str,
-        intended_option_text: str,
-        what_happened: str | None = None,
-    ) -> str:
-        return _record_dropdown_failure(field_label, intended_option_text, what_happened)
 
     @tools.action(
         description=(
@@ -1785,11 +1824,6 @@ async def _run(
         telemetry_thread = threading.Thread(target=_telemetry_loop, daemon=True)
         telemetry_thread.start()
 
-    # Short ring buffer of recent `ask_user_for_missing_info` field_paths so we can
-    # detect the agent spinning on the same question.
-    recent_ask_keys: list[str] = []
-    _RECENT_ASK_STUCK_WINDOW = 4  # number of consecutive identical calls that triggers an escalation nudge
-
     # Per-step screenshot capture. Index is incremented on every successful post so
     # `NNNN.png` maps 1:1 to agent step order. Capped by ORCH_SCREENSHOT_MAX_PER_RUN.
     _step_shot_counter = {"i": 0}
@@ -1905,123 +1939,6 @@ async def _run(
                 ok = False
             if ok:
                 _step_shot_counter["i"] = idx + 1
-
-    async def _on_step_end(agent: Any) -> None:
-        """
-        If the agent already called `dropdown_selection_failed`, do nothing. Otherwise, when next_goal names quoted
-        dropdown targets but results show a wrong `Clicked li` label or a stale element index, trigger the same
-        immediate pause as `dropdown_selection_failed` (at most once per step).
-
-        Screenshots used to be taken here on every step; they're now taken
-        whenever the agent fills a form field (see `_install_typed_value_tracker`).
-        """
-        try:
-            hist = getattr(agent, "history", None)
-            items = getattr(hist, "history", None) if hist is not None else None
-            if not items:
-                return
-            last = items[-1]
-            mo = getattr(last, "model_output", None)
-            results = getattr(last, "result", None) or []
-            if mo is None:
-                return
-            action_blob = str(getattr(mo, "action", ""))
-
-            # --- Repetition guard for ask_user_for_missing_info ----------------
-            # If the agent calls this tool for the same field_path multiple times in a
-            # row, the tool already returns the value but the agent is failing to fill
-            # the form. Force a manual-intervention pause so we don't burn steps.
-            try:
-                m = re.search(
-                    r'ask_user_for_missing_info[^}]*?field_path["\']?\s*[:=]\s*["\']([^"\']+)["\']',
-                    action_blob,
-                )
-                if m:
-                    key = m.group(1).strip()
-                    recent_ask_keys.append(key)
-                    if len(recent_ask_keys) > _RECENT_ASK_STUCK_WINDOW:
-                        recent_ask_keys.pop(0)
-                    if (
-                        len(recent_ask_keys) >= _RECENT_ASK_STUCK_WINDOW
-                        and all(k == key for k in recent_ask_keys)
-                    ):
-                        recent_ask_keys.clear()
-                        cached = resolved_fields.get(key) or profiler._get_value_from_profile_db(key)
-                        _record_dropdown_failure(
-                            key,
-                            str(cached) if cached not in (None, "") else "<unknown>",
-                            (
-                                f"Agent is looping on ask_user_for_missing_info for {key!r} "
-                                f"(already resolved: {cached!r}). Please set this control manually "
-                                "in the browser."
-                            ),
-                        )
-                        return
-                else:
-                    # Non-ask action breaks the chain of identical ask calls.
-                    recent_ask_keys.clear()
-            except Exception:
-                recent_ask_keys.clear()
-            # -----------------------------------------------------------------
-
-            if "dropdown_selection_failed" in action_blob:
-                return
-            ng = getattr(mo, "next_goal", None) or ""
-            ng_l = str(ng).lower()
-            if not any(
-                k in ng_l
-                for k in (
-                    "dropdown",
-                    "select",
-                    "auswählen",
-                    "land",
-                    "country",
-                    "location",
-                    "standort",
-                    "wunsch",
-                    "city",
-                    "deutschland",
-                    "hamburg",
-                    "nationality",
-                    "nationalität",
-                )
-            ):
-                return
-            targets = _quoted_targets_ordered_from_text(str(ng))
-            if not targets:
-                return
-            clicks = _clicked_li_labels_from_results(results)
-            blob = _action_results_text_blob(results)
-            for i in range(min(len(targets), len(clicks))):
-                ti, ci = targets[i], clicks[i]
-                if _dropdown_option_texts_equivalent(ti, ci):
-                    continue
-                fl = _infer_dropdown_field_label(
-                    ti,
-                    resolved_fields=resolved_fields,
-                    profile_fields=profile_fields,
-                )
-                _record_dropdown_failure(
-                    fl,
-                    ti,
-                    f"Auto-detected mismatch: quoted target {ti!r} vs tool result Clicked li {ci!r}.",
-                )
-                return
-            bl = blob.lower()
-            if "not available" in bl and "index" in bl:
-                t0 = targets[0]
-                fl = _infer_dropdown_field_label(
-                    t0,
-                    resolved_fields=resolved_fields,
-                    profile_fields=profile_fields,
-                )
-                _record_dropdown_failure(
-                    fl,
-                    t0,
-                    "Auto-detected: element index not available or page changed during dropdown interaction.",
-                )
-        except Exception:
-            return
 
     agent = Agent(
         task=_build_task(job_url, profile),
@@ -2141,11 +2058,6 @@ async def _run(
 
     try:
         run_kw: dict[str, Any] = {"max_steps": max_steps}
-        try:
-            if "on_step_end" in inspect.signature(agent.run).parameters:
-                run_kw["on_step_end"] = _on_step_end
-        except Exception:
-            pass
         history = await agent.run(**run_kw)
         try:
             final = history.final_result()

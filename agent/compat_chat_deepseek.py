@@ -118,6 +118,56 @@ def _json_candidates(s: str) -> list[str]:
     return out
 
 
+def unwrap_agent_output_json_blob(parsed: Any) -> Any:
+    """
+    Fix common malformed shapes before AgentOutput validation:
+
+    - Extra HTML / attribute text before the JSON object (e.g. `=\"true\">{ "thinking": ...`).
+    - A single `string` field whose value is JSON (or JSON with leading junk) for the real step.
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    if parsed.get("action") is not None:
+        out = dict(parsed)
+        out.pop("string", None)
+        return out
+
+    raw = parsed.get("string")
+    if isinstance(raw, str) and raw.strip():
+        s = raw.strip()
+        i = _first_structural_index(s)
+        if i > 0:
+            s = s[i:]
+        try:
+            inner = _json_loads_llm(s)
+        except json.JSONDecodeError:
+            inner = None
+        if isinstance(inner, dict) and inner.get("action") is not None:
+            inner.pop("string", None)
+            return inner
+        mkey = raw.find('"action"')
+        if mkey >= 0:
+            start = raw.rfind("{", 0, mkey)
+            if start >= 0:
+                blob = _extract_json_at(raw, start)
+                if blob:
+                    try:
+                        inner2 = json.loads(blob)
+                    except json.JSONDecodeError:
+                        inner2 = None
+                    if isinstance(inner2, dict) and inner2.get("action") is not None:
+                        inner2.pop("string", None)
+                        return inner2
+
+    for _k, v in parsed.items():
+        if isinstance(v, str) and '"action"' in v and _k != "string":
+            r = unwrap_agent_output_json_blob({"string": v})
+            if isinstance(r, dict) and r.get("action") is not None:
+                return r
+
+    return parsed
+
+
 def _json_loads_llm(s: str) -> Any:
     """
     Parse JSON from an LLM string: tolerate markdown code fences and leading/trailing noise by
@@ -165,11 +215,14 @@ def _infer_action_name_and_inner_dict(parsed: dict[str, Any]) -> tuple[str, dict
         if "clear" in parsed:
             inner["clear"] = bool(parsed.get("clear", True))
         return "input", inner
-    if "field_path" in keys and "question" in keys and keys <= {"field_path", "question"}:
-        return "ask_user_for_missing_info", {
+    if "field_path" in keys and "question" in keys and keys <= {"field_path", "question", "ui"}:
+        inner: dict[str, Any] = {
             "field_path": str(parsed["field_path"]),
             "question": str(parsed["question"]),
         }
+        if isinstance(parsed.get("ui"), dict):
+            inner["ui"] = parsed["ui"]
+        return "ask_user_for_missing_info", inner
     if len(keys) == 1 and "fields" in keys and isinstance(parsed.get("fields"), list):
         return "resolve_fields", {"fields": list(parsed["fields"])}
     if len(keys) == 1 and "documents" in keys and isinstance(parsed.get("documents"), list):
@@ -271,6 +324,8 @@ def _validate_agent_output(
     parsed: Any,
 ) -> BaseModel:
     """Model validate with one repair pass for partial DeepSeek / AgentOutput JSON (see module doc)."""
+    if isinstance(parsed, dict):
+        parsed = unwrap_agent_output_json_blob(parsed)
     if output_format is None or not isinstance(parsed, dict):
         return output_format.model_validate(parsed)  # type: ignore[union-attr]
     try:

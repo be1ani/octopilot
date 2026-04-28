@@ -13,6 +13,7 @@ import {
   FiX,
 } from "react-icons/fi";
 import { ReviewSubmitDialog } from "./ReviewSubmitDialog.jsx";
+import { HumanInputPanel } from "./HumanInputPanel.jsx";
 import "./MachineCard.css";
 
 const HIDDEN_IMAGE_LABELS = new Set(["", "latest", "LATEST", "Latest"]);
@@ -203,6 +204,8 @@ export function MachineCard({
   }, [budgetExceeded, budgetAck, urgentSoundBlocked]);
 
   const showFrames = status === "running" && desktopUrl && terminalUrl && desktopReady && terminalReady;
+
+  const [bottomPanel, setBottomPanel] = useState("terminal");
 
   const canStop = status !== "stopped" && status !== "error";
   const canRestart = status !== "starting";
@@ -655,26 +658,61 @@ export function MachineCard({
               </div>
             ) : null}
           </div>
-          <div
-            className="iframe-shell terminal-shell"
-            style={{ width: vw, height: TERMINAL_HEIGHT }}
-          >
-            {showFrames ? (
-              <iframe
-                title={`terminal-${id}`}
-                src={terminalUrl}
-                width={vw}
-                height={TERMINAL_HEIGHT}
-                className="embed"
-                onLoad={(e) => injectDarkScrollbarsIntoIframe(e.currentTarget)}
-              />
+          <div className="machine-bottom-stack" style={{ width: vw }}>
+            <div className="machine-bottom-tablist" role="tablist" aria-label="Agent output">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={bottomPanel === "terminal"}
+                className={`machine-bottom-tab${bottomPanel === "terminal" ? " machine-bottom-tab--active" : ""}`}
+                onClick={() => setBottomPanel("terminal")}
+              >
+                Terminal
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={bottomPanel === "input"}
+                className={`machine-bottom-tab${bottomPanel === "input" ? " machine-bottom-tab--active" : ""}`}
+                onClick={() => setBottomPanel("input")}
+              >
+                Input
+              </button>
+            </div>
+            {bottomPanel === "terminal" ? (
+              <div
+                className="iframe-shell terminal-shell"
+                style={{ width: vw, height: TERMINAL_HEIGHT }}
+              >
+                {showFrames ? (
+                  <iframe
+                    title={`terminal-${id}`}
+                    src={terminalUrl}
+                    width={vw}
+                    height={TERMINAL_HEIGHT}
+                    className="embed"
+                    onLoad={(e) => injectDarkScrollbarsIntoIframe(e.currentTarget)}
+                  />
+                ) : (
+                  <div className="iframe-placeholder">
+                    {status === "stopped"
+                      ? "—"
+                      : status === "starting" || terminalReady === false
+                        ? "Booting terminal…"
+                        : "Terminal unavailable"}
+                  </div>
+                )}
+              </div>
             ) : (
-              <div className="iframe-placeholder">
-                {status === "stopped"
-                  ? "—"
-                  : status === "starting" || terminalReady === false
-                    ? "Booting terminal…"
-                    : "Terminal unavailable"}
+              <div
+                className="iframe-shell terminal-shell machine-human-input-shell"
+                style={{ width: vw, height: TERMINAL_HEIGHT }}
+              >
+                {showFrames ? (
+                  <HumanInputPanel machineId={id} pollActive={showFrames && bottomPanel === "input"} />
+                ) : (
+                  <div className="iframe-placeholder">Input unavailable</div>
+                )}
               </div>
             )}
           </div>

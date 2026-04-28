@@ -251,6 +251,35 @@ def _orch_llm_ledger_collection_name() -> str:
     return (os.environ.get("ORCH_LLM_LEDGER_COLLECTION") or "").strip() or "llm_ledger"
 
 
+def _orch_human_input_collection_name() -> str:
+    return (os.environ.get("ORCH_HUMAN_INPUT_COLLECTION") or "").strip() or "human_input_requests"
+
+
+def _human_input_poll_hint_s(created_at: float) -> float:
+    """Match agent-side backoff (caps at 5s) for UI display."""
+    e = max(0.0, time.time() - float(created_at))
+    if e < 15.0:
+        return 0.25
+    if e < 30.0:
+        return 0.5
+    if e < 60.0:
+        return 1.0
+    if e < 120.0:
+        return 2.0
+    return 5.0
+
+
+def _human_input_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    coll = db[_orch_human_input_collection_name()]
+    try:
+        coll.create_index([("machine_id", 1), ("status", 1)], name="machine_status")
+        coll.create_index([("created_at", -1)], name="created_desc")
+    except PyMongoError:
+        pass
+    return coll
+
+
 def _state_coll() -> Collection:
     db = _mongo()[_orch_mongo_db_name()]
     return db[_orch_state_collection_name()]
@@ -2475,6 +2504,105 @@ def set_attention(mid: str):
                 save_state(data)
                 return jsonify(machine_public_view(_machine_from_dict(row), now))
         return jsonify({"error": "not found"}), 404
+
+
+def _human_input_machine_exists(mid: str) -> bool:
+    with _state_lock:
+        data = load_state()
+        return any(r.get("id") == mid for r in (data.get("machines") or []))
+
+
+@app.put("/api/machines/<mid>/human-input/requests/<rid>")
+def human_input_put_request(mid: str, rid: str):
+    """Agent registers a pending human-input card (short-poll + UI)."""
+    if not _human_input_machine_exists(mid):
+        return jsonify({"error": "not found"}), 404
+    body = request.get_json(silent=True) or {}
+    kind = str(body.get("kind") or "field").strip() or "field"
+    item = body.get("item")
+    if not isinstance(item, dict):
+        item = {}
+    coll = _human_input_coll()
+    now = time.time()
+    coll.delete_many({"machine_id": mid, "status": "pending", "_id": {"$ne": rid}})
+    doc = {
+        "_id": rid,
+        "machine_id": mid,
+        "status": "pending",
+        "created_at": now,
+        "kind": kind,
+        "item": item,
+        "response": None,
+        "answered_at": None,
+    }
+    coll.replace_one({"_id": rid}, doc, upsert=True)
+    return jsonify({"ok": True, "request_id": rid})
+
+
+@app.get("/api/machines/<mid>/human-input/requests/<rid>")
+def human_input_get_request(mid: str, rid: str):
+    """Agent polls until status becomes answered."""
+    coll = _human_input_coll()
+    cur = coll.find_one({"_id": rid})
+    if not cur or cur.get("machine_id") != mid:
+        return jsonify({"error": "not found"}), 404
+    out = {k: v for k, v in cur.items() if k != "_id"}
+    out["request_id"] = str(cur.get("_id"))
+    cr = cur.get("created_at")
+    if isinstance(cr, (int, float)) and cur.get("status") == "pending":
+        out["poll_hint_interval_s"] = _human_input_poll_hint_s(float(cr))
+    return jsonify(out)
+
+
+@app.delete("/api/machines/<mid>/human-input/requests/<rid>")
+def human_input_delete_request(mid: str, rid: str):
+    coll = _human_input_coll()
+    coll.delete_one({"_id": rid, "machine_id": mid})
+    return jsonify({"ok": True})
+
+
+@app.get("/api/machines/<mid>/human-input/current")
+def human_input_current(mid: str):
+    """UI polls for the active pending prompt for this machine."""
+    if not _human_input_machine_exists(mid):
+        return jsonify({"error": "not found"}), 404
+    coll = _human_input_coll()
+    cur = coll.find_one({"machine_id": mid, "status": "pending"}, sort=[("created_at", -1)])
+    if not cur:
+        return jsonify({"pending": False})
+    cr = cur.get("created_at")
+    ph = _human_input_poll_hint_s(float(cr)) if isinstance(cr, (int, float)) else 0.25
+    return jsonify(
+        {
+            "pending": True,
+            "request_id": str(cur.get("_id")),
+            "created_at": cr,
+            "poll_hint_interval_s": ph,
+            "kind": cur.get("kind"),
+            "item": cur.get("item") if isinstance(cur.get("item"), dict) else {},
+        }
+    )
+
+
+@app.post("/api/machines/<mid>/human-input/requests/<rid>/answer")
+def human_input_post_answer(mid: str, rid: str):
+    """Browser submits an answer for a pending request."""
+    coll = _human_input_coll()
+    cur = coll.find_one({"_id": rid})
+    if not cur or cur.get("machine_id") != mid:
+        return jsonify({"error": "not found"}), 404
+    if cur.get("status") != "pending":
+        return jsonify({"error": "not pending"}), 409
+    body = request.get_json(silent=True) or {}
+    resp: dict[str, Any] = {}
+    for k in ("value", "force_submit", "promote_to_absolute", "confirmed", "continue"):
+        if k in body:
+            resp[k] = body[k]
+    coll.update_one(
+        {"_id": rid},
+        {"$set": {"status": "answered", "response": resp, "answered_at": time.time()}},
+    )
+    return jsonify({"ok": True})
 
 
 @app.post("/api/machines/<mid>/telemetry")

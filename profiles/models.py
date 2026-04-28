@@ -115,7 +115,9 @@ class BaseInfo(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    full_name: str = Field(min_length=1)
+    # Default keeps Profile valid when applicant scalars live only under
+    # `other.custom.{relative,absolute}_fields` (no writes to `base.*` from tools).
+    full_name: str = Field(default="Unknown", min_length=1)
     email: Optional[EmailStr] = None
     phone: Optional[str] = None
     address: Optional[str] = None

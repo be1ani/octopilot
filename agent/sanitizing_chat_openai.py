@@ -11,6 +11,8 @@ import json
 from collections.abc import Iterable
 from typing import Any, TypeVar, overload
 
+from agent.compat_chat_deepseek import _extract_json_at, unwrap_agent_output_json_blob
+
 from openai import APIConnectionError, APIStatusError, RateLimitError
 from openai.types.chat import ChatCompletionContentPartTextParam
 from openai.types.shared_params.response_format_json_schema import JSONSchema, ResponseFormatJSONSchema
@@ -60,6 +62,14 @@ def _json_text_candidates(raw: str | None) -> list[str]:
                         out.append(slim_b)
                 except json.JSONDecodeError:
                     pass
+
+    mkey = s.find('"action"')
+    if mkey >= 0:
+        start = s.rfind("{", 0, mkey)
+        if start >= 0:
+            blob = _extract_json_at(s, start)
+            if blob and blob not in out:
+                out.append(blob)
 
     return out
 
@@ -196,7 +206,9 @@ class SanitizingChatOpenAI(ChatOpenAI):
             parsed: T | None = None
             for candidate in _json_text_candidates(choice.message.content):
                 try:
-                    parsed = output_format.model_validate_json(candidate)
+                    obj = json.loads(candidate)
+                    obj = unwrap_agent_output_json_blob(obj)
+                    parsed = output_format.model_validate(obj)
                     break
                 except Exception as e:
                     last_err = e

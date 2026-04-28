@@ -5,7 +5,7 @@ import os
 import re
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Best-effort: enable readline so arrow keys and history work during input() and
 # don't corrupt the value with raw ANSI escape bytes (e.g. "720\x1b[C00" for salary).
@@ -31,6 +31,53 @@ def _sanitize_user_input(s: str) -> str:
 from pydantic import BaseModel, Field
 
 from profiles.master_schema import MasterSchemaStore, load_master_schema, save_master_schema, upsert_field
+
+HumanValueKind = Literal[
+    "text",
+    "number",
+    "date",
+    "multiline",
+    "single_select",
+    "multi_select",
+    "boolean",
+    "file_path",
+]
+
+
+class FieldUiSpec(BaseModel):
+    display_name: str = Field(description="Short label for the UI, e.g. 'Birth date'.")
+    value_kind: HumanValueKind = Field(
+        default="multiline",
+        description="Input control: text, number, date, multiline, single_select, multi_select, boolean, file_path.",
+    )
+    help_text: str | None = Field(
+        default=None,
+        description="Optional extra guidance (format, examples, form wording).",
+    )
+    options: list[dict[str, str]] | None = Field(
+        default=None,
+        description='For select kinds: [{"value":"internal","label":"Shown"}, ...].',
+    )
+    sensitive: bool = Field(default=False, description="If true, mask input in the orchestrator UI.")
+    validation: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional soft rules: pattern (regex), min, max, required (bool).",
+    )
+
+
+class DocumentUiSpec(BaseModel):
+    display_name: str | None = Field(default=None, description="Label for document upload in the UI.")
+    help_text: str | None = Field(default=None, description="Optional extra guidance for this upload slot.")
+
+
+class AskUserMissingInfoParams(BaseModel):
+    field_path: str
+    question: str
+    ui: FieldUiSpec | None = Field(
+        default=None,
+        description="Structured UI metadata; if omitted, a generic multiline prompt is used.",
+    )
+
 from profiles.models import Profile
 from profiles.store import OrchestratorProfileStore, ProfileStore
 
@@ -40,6 +87,10 @@ class FieldRequest(BaseModel):
     label: str | None = None
     prompt: str | None = None
     default: str | None = None
+    ui: FieldUiSpec | None = Field(
+        default=None,
+        description="Structured UI metadata from the model (recommended for orchestrator runs).",
+    )
 
 
 class ResolveFieldsParams(BaseModel):
@@ -49,6 +100,7 @@ class ResolveFieldsParams(BaseModel):
 class DocumentRequest(BaseModel):
     key: str = Field(description="Stable key for this document, e.g. 'documents.resume' or 'documents.other'.")
     label: str | None = Field(default=None, description="Human-friendly label, e.g. 'Resume', 'Cover letter', 'Other'.")
+    ui: DocumentUiSpec | None = Field(default=None, description="Optional UI hints for the orchestrator panel.")
     required: bool = Field(default=False, description="Whether the upload is required by the form.")
     explicitly_specified: bool = Field(
         default=False,
@@ -203,6 +255,17 @@ def _deep_set(obj: dict[str, Any], path: str, value: Any) -> None:
             cur[part] = nxt
         cur = nxt
     cur[parts[-1]] = value
+
+
+# Forms / LLMs often use keys that differ from `Profile.base` (Pydantic `BaseInfo`) names.
+_PROFILE_STORAGE_KEY_ALIASES: dict[str, str] = {
+    "base.date_of_birth": "base.birthdate",
+}
+
+
+def _resolve_profile_storage_key(key: str) -> str:
+    k = (key or "").strip()
+    return _PROFILE_STORAGE_KEY_ALIASES.get(k, k)
 
 
 class PromptUI:
@@ -375,26 +438,56 @@ class Profiler:
 
     def _get_value_from_profile_db(self, key: str) -> str | None:
         d = self._profile_dict()
-        if key in ("base.full_name.first_name", "base.full_name.last_name"):
-            full = _deep_get(d, "base.full_name")
-            if isinstance(full, dict):
-                sub = "first_name" if key.endswith("first_name") else "last_name"
-                v = full.get(sub)
-                return None if v in (None, "") else str(v)
-            if isinstance(full, str):
-                first, last = _parse_full_name_string(full)
-                v = first if key.endswith("first_name") else last
-                return None if v in (None, "") else str(v)
+
+        def _from_custom_maps() -> str | None:
+            rk = _resolve_profile_storage_key(key)
+            custom = self._custom_bucket()
+            abs_map = custom.get("absolute_fields")
+            rel_map = custom.get("relative_fields")
+            if isinstance(abs_map, dict):
+                for probe in (rk, key):
+                    if probe in abs_map:
+                        v = abs_map.get(probe)
+                        if v not in (None, ""):
+                            return str(v)
+            if isinstance(rel_map, dict):
+                for probe in (rk, key):
+                    if probe in rel_map:
+                        v = rel_map.get(probe)
+                        if v not in (None, ""):
+                            return str(v)
             return None
-        if key.startswith("base.address.") and key != "base.address":
-            sub = key.removeprefix("base.address.")
-            canon = _canonical_address_subkey(sub)
-            if canon is not None:
-                raw = _deep_get(d, "base.address")
-                parts = _address_parts_from_current(raw)
-                v = parts.get(canon, "")
-                return None if v in (None, "") else str(v)
-        if key.startswith("base.") or key.startswith("other."):
+
+        if key.startswith("base."):
+            mv = _from_custom_maps()
+            if mv is not None:
+                return mv
+            if key in ("base.full_name.first_name", "base.full_name.last_name"):
+                full = _deep_get(d, "base.full_name")
+                if isinstance(full, dict):
+                    sub = "first_name" if key.endswith("first_name") else "last_name"
+                    v = full.get(sub)
+                    return None if v in (None, "") else str(v)
+                if isinstance(full, str):
+                    first, last = _parse_full_name_string(full)
+                    v = first if key.endswith("first_name") else last
+                    return None if v in (None, "") else str(v)
+                return None
+            if key.startswith("base.address.") and key != "base.address":
+                sub = key.removeprefix("base.address.")
+                canon = _canonical_address_subkey(sub)
+                if canon is not None:
+                    raw = _deep_get(d, "base.address")
+                    parts = _address_parts_from_current(raw)
+                    v = parts.get(canon, "")
+                    return None if v in (None, "") else str(v)
+            rk = _resolve_profile_storage_key(key)
+            for probe in (rk, key):
+                v = _deep_get(d, probe)
+                if v not in (None, ""):
+                    return str(v)
+            return None
+        if key.startswith("other."):
             v = _deep_get(d, key)
             return None if v in (None, "") else str(v)
 
@@ -445,35 +538,28 @@ class Profiler:
 
     def _set_value_in_profile_db(self, key: str, value: Any, *, category: str) -> None:
         d = self._profile_dict()
-        if key == "base.full_name.first_name" or key == "base.full_name.last_name":
-            base = d.setdefault("base", {})
-            if not isinstance(base, dict):
-                base = {}
-                d["base"] = base
-            current = base.get("full_name")
-            first_kw = str(value).strip() if key.endswith("first_name") else None
-            last_kw = str(value).strip() if key.endswith("last_name") else None
-            merged = _merge_full_name_parts(current, first=first_kw, last=last_kw)
-            if not merged:
-                merged = "Unknown"
-            base["full_name"] = merged
+        if key.startswith("base."):
+            rk = _resolve_profile_storage_key(key)
+            custom = d.setdefault("other", {}).setdefault("custom", {})
+            if not isinstance(custom, dict):
+                d["other"]["custom"] = {}
+                custom = d["other"]["custom"]
+            if category == "absolute":
+                abs_map = custom.setdefault("absolute_fields", {})
+                if not isinstance(abs_map, dict):
+                    custom["absolute_fields"] = {}
+                    abs_map = custom["absolute_fields"]
+                abs_map[rk] = value
+            else:
+                rel_map = custom.setdefault("relative_fields", {})
+                if not isinstance(rel_map, dict):
+                    custom["relative_fields"] = {}
+                    rel_map = custom["relative_fields"]
+                rel_map[rk] = value
             self._set_profile_from_dict(d)
             self._save_profile_model()
             return
-        if key.startswith("base.address.") and key != "base.address":
-            sub = key.removeprefix("base.address.")
-            if _canonical_address_subkey(sub) is not None:
-                base = d.setdefault("base", {})
-                if not isinstance(base, dict):
-                    base = {}
-                    d["base"] = base
-                current = base.get("address")
-                merged = _merge_address_field(current, sub, str(value))
-                base["address"] = merged
-                self._set_profile_from_dict(d)
-                self._save_profile_model()
-                return
-        if key.startswith("base.") or key.startswith("other."):
+        if key.startswith("other."):
             _deep_set(d, key, value)
             self._set_profile_from_dict(d)
             self._save_profile_model()
@@ -526,6 +612,111 @@ class Profiler:
             unrecognized=unrecognized,
         )
         save_master_schema(self.master, self.schema_path)
+
+    @staticmethod
+    def _orch_human_enabled() -> bool:
+        from agent.orch_human_input import human_input_backend
+
+        return human_input_backend() == "orch"
+
+    def _orch_resolve_field_value(
+        self,
+        *,
+        f: FieldRequest,
+        mf: Any,
+        label: str,
+        prompt: str,
+        default_str: str | None,
+    ) -> tuple[str, bool]:
+        from agent import orch_human_input as ohi
+
+        spec = f.ui or FieldUiSpec(
+            display_name=(label or f.key).strip() or f.key.strip(),
+            value_kind="multiline",
+            help_text=prompt,
+        )
+        show_promote = bool(mf.unrecognized)
+        while True:
+            rid = ohi.new_request_id()
+            item = {
+                "field_key": f.key.strip(),
+                "display_name": spec.display_name,
+                "help_text": (spec.help_text or prompt or "").strip() or None,
+                "value_kind": spec.value_kind,
+                "default_value": default_str,
+                "options": spec.options,
+                "sensitive": bool(spec.sensitive),
+                "validation": spec.validation,
+                "show_promote_to_absolute": show_promote,
+            }
+            resp = ohi.wait_human_response(
+                request_id=rid,
+                kind="field",
+                item=item,
+                attention_reason=f"resolve field: {spec.display_name}",
+            )
+            promote = bool(resp.get("promote_to_absolute"))
+            raw = resp.get("value")
+            if spec.value_kind == "multi_select":
+                if isinstance(raw, list):
+                    val_s = json.dumps([str(x) for x in raw], ensure_ascii=False)
+                elif raw in (None, ""):
+                    val_s = ""
+                else:
+                    val_s = str(raw).strip()
+            elif spec.value_kind == "boolean":
+                if isinstance(raw, bool):
+                    val_s = "yes" if raw else "no"
+                else:
+                    val_s = str(raw).strip().lower()
+                    if val_s in ("1", "true", "yes", "y"):
+                        val_s = "yes"
+                    elif val_s in ("0", "false", "no", "n"):
+                        val_s = "no"
+                    else:
+                        val_s = ""
+            else:
+                val_s = "" if raw is None else str(raw).strip()
+
+            if not val_s and default_str is not None:
+                return str(default_str), promote
+            if val_s:
+                return val_s, promote
+
+    def _orch_prompt_file_path(
+        self,
+        *,
+        field_key: str,
+        label: str,
+        help_text: str,
+        default_hint: str | None,
+        show_promote: bool,
+        attention_reason: str,
+    ) -> tuple[str, bool]:
+        from agent import orch_human_input as ohi
+
+        rid = ohi.new_request_id()
+        item = {
+            "field_key": field_key,
+            "display_name": label,
+            "help_text": help_text,
+            "value_kind": "file_path",
+            "default_value": default_hint,
+            "options": None,
+            "sensitive": False,
+            "validation": None,
+            "show_promote_to_absolute": show_promote,
+        }
+        resp = ohi.wait_human_response(
+            request_id=rid,
+            kind="document",
+            item=item,
+            attention_reason=attention_reason,
+        )
+        promote = bool(resp.get("promote_to_absolute"))
+        raw = resp.get("value")
+        val_s = "" if raw is None else str(raw).strip()
+        return val_s, promote
 
     def resolve_fields(self, params: ResolveFieldsParams) -> str:
         fields = params.fields
@@ -593,9 +784,16 @@ class Profiler:
             # the user can see which control the question is about before
             # answering (especially useful when several similar fields exist).
             self.ui._highlight_field(label=label, key=key, prompt=prompt)
-            ans = self.ui.prompt_with_default(prompt, default_str).strip()
-            if not ans:
-                ans = self.ui.prompt_nonempty(prompt)
+            orch_promote = False
+            if self._orch_human_enabled():
+                ans, orch_promote = self._orch_resolve_field_value(
+                    f=f, mf=mf, label=label, prompt=prompt, default_str=default_str
+                )
+                ans = ans.strip() if isinstance(ans, str) else str(ans)
+            else:
+                ans = self.ui.prompt_with_default(prompt, default_str).strip()
+                if not ans:
+                    ans = self.ui.prompt_nonempty(prompt)
 
             out[key] = ans
             self._set_value_in_profile_db(key, ans, category=mf.category)
@@ -605,10 +803,11 @@ class Profiler:
                 self.relative_used_in_current_form = True
 
             if mf.unrecognized:
-                if self.ui.prompt_yes_no(
+                do_promote = orch_promote if self._orch_human_enabled() else self.ui.prompt_yes_no(
                     f'Use "{ans}" for all future prompts for "{label}" (promote to absolute)?',
                     default_no=True,
-                ):
+                )
+                if do_promote:
                     mf.category = "absolute"
                     mf.unrecognized = False
                     upsert_field(self.master, key=key, label=label, category="absolute", unrecognized=False)
@@ -681,10 +880,17 @@ class Profiler:
             assert mf is not None
 
             label = (mf.label or d.label or key).strip()
+            if d.ui and d.ui.display_name:
+                label = str(d.ui.display_name).strip() or label
             default_val = self._get_raw_document_value(key)
 
             if not d.required and not default_val:
                 continue
+
+            doc_help = (d.ui.help_text if d.ui and d.ui.help_text else None) or (
+                f"Absolute file path on the agent machine for “{label}”."
+            )
+            orch_doc = self._orch_human_enabled()
 
             if d.allow_multiple:
                 existing_list: list[str] = []
@@ -694,34 +900,56 @@ class Profiler:
                     existing_list = [default_val]
 
                 print(f'\nProvide file paths for "{label}".')
-                print("- Enter one path per prompt.")
-                print("- Press Enter on an empty prompt to finish.\n")
+                if not orch_doc:
+                    print("- Enter one path per prompt.")
+                    print("- Press Enter on an empty prompt to finish.\n")
                 chosen_list: list[str] = []
                 default_hint = existing_list[0] if len(existing_list) == 1 else None
                 if existing_list and len(existing_list) > 1:
                     print(f"Default files:\n- " + "\n- ".join(existing_list) + "\n")
 
-                first = self.ui.prompt_with_default(f'File path for "{label}"', default_hint).strip()
-                if first:
-                    # Accept JSON list pasted by user
-                    if first.lstrip().startswith("["):
-                        try:
-                            parsed = json.loads(first)
-                            if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
-                                chosen_list.extend(parsed)
-                            else:
+                if orch_doc:
+                    any_promote = False
+                    slot = 1
+                    while True:
+                        slot_label = f"{label} (file {slot})" if slot > 1 else label
+                        hint = existing_list[slot - 1] if 0 <= slot - 1 < len(existing_list) else None
+                        ht = doc_help if slot == 1 else f"{doc_help} Leave empty when finished adding files."
+                        path_s, prom = self._orch_prompt_file_path(
+                            field_key=key,
+                            label=slot_label,
+                            help_text=ht,
+                            default_hint=hint,
+                            show_promote=bool(mf.unrecognized),
+                            attention_reason=f"document: {label}",
+                        )
+                        any_promote = any_promote or prom
+                        if not path_s.strip():
+                            break
+                        chosen_list.append(path_s.strip())
+                        slot += 1
+                    orch_doc_promote = any_promote
+                else:
+                    orch_doc_promote = False
+                    first = self.ui.prompt_with_default(f'File path for "{label}"', default_hint).strip()
+                    if first:
+                        if first.lstrip().startswith("["):
+                            try:
+                                parsed = json.loads(first)
+                                if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+                                    chosen_list.extend(parsed)
+                                else:
+                                    chosen_list.append(first)
+                            except Exception:
                                 chosen_list.append(first)
-                        except Exception:
+                        else:
                             chosen_list.append(first)
-                    else:
-                        chosen_list.append(first)
-                while True:
-                    nxt = self.ui.prompt_with_default(f'Another file for "{label}" (blank to finish)', None).strip()
-                    if not nxt:
-                        break
-                    chosen_list.append(nxt)
+                    while True:
+                        nxt = self.ui.prompt_with_default(f'Another file for "{label}" (blank to finish)', None).strip()
+                        if not nxt:
+                            break
+                        chosen_list.append(nxt)
 
-                # Validate files
                 chosen_paths: list[str] = []
                 for raw in chosen_list:
                     pth = str(Path(raw).expanduser())
@@ -744,38 +972,53 @@ class Profiler:
                     if pth not in available_files:
                         available_files.append(pth)
             else:
-                # If a list was stored but this slot is single-file, use the first element as default.
                 single_default: str | None = None
                 if isinstance(default_val, list) and default_val and isinstance(default_val[0], str):
                     single_default = default_val[0]
                 elif isinstance(default_val, str) and default_val.strip():
                     single_default = default_val
 
-                chosen = self.ui.prompt_with_default(
-                    f'Path to upload for "{label}"',
-                    single_default,
-                ).strip()
+                if orch_doc:
+                    chosen, orch_doc_promote = self._orch_prompt_file_path(
+                        field_key=key,
+                        label=label,
+                        help_text=doc_help,
+                        default_hint=single_default,
+                        show_promote=bool(mf.unrecognized),
+                        attention_reason=f"document: {label}",
+                    )
+                    chosen = chosen.strip()
+                else:
+                    orch_doc_promote = False
+                    chosen = self.ui.prompt_with_default(
+                        f'Path to upload for "{label}"',
+                        single_default,
+                    ).strip()
 
-                while True:
-                    # Accept JSON list pasted by user; take first element.
-                    if chosen.lstrip().startswith("["):
-                        try:
-                            parsed = json.loads(chosen)
-                            if isinstance(parsed, list) and parsed and isinstance(parsed[0], str):
-                                chosen = parsed[0]
-                        except Exception:
-                            pass
-                    if chosen and Path(chosen).expanduser().is_file():
-                        break
-                    if not chosen and not d.required:
-                        chosen = ""
-                        break
-                    chosen = self.ui.prompt_nonempty(f'Path to upload for "{label}" (must be an existing file path)').strip()
+                    while True:
+                        if chosen.lstrip().startswith("["):
+                            try:
+                                parsed = json.loads(chosen)
+                                if isinstance(parsed, list) and parsed and isinstance(parsed[0], str):
+                                    chosen = parsed[0]
+                            except Exception:
+                                pass
+                        if chosen and Path(chosen).expanduser().is_file():
+                            break
+                        if not chosen and not d.required:
+                            chosen = ""
+                            break
+                        chosen = self.ui.prompt_nonempty(
+                            f'Path to upload for "{label}" (must be an existing file path)'
+                        ).strip()
 
                 if not chosen:
                     continue
 
                 chosen_path = str(Path(chosen).expanduser())
+                if not Path(chosen_path).is_file():
+                    raise InterruptedError(f"Document path is not a file: {chosen_path}")
+
                 out[key] = chosen_path
                 self._set_value_in_profile_db(key, chosen_path, category=mf.category)
 
@@ -786,10 +1029,15 @@ class Profiler:
                 self.relative_used_in_current_form = True
 
             if mf.unrecognized:
-                if self.ui.prompt_yes_no(
-                    f'Use this document for all future "{label}" prompts (promote to absolute)?',
-                    default_no=True,
-                ):
+                do_promote = (
+                    orch_doc_promote
+                    if orch_doc
+                    else self.ui.prompt_yes_no(
+                        f'Use this document for all future "{label}" prompts (promote to absolute)?',
+                        default_no=True,
+                    )
+                )
+                if do_promote:
                     mf.category = "absolute"
                     mf.unrecognized = False
                     upsert_field(self.master, key=key, label=label, category="absolute", unrecognized=False)
