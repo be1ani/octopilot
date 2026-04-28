@@ -41,9 +41,62 @@ from browser_use.llm.deepseek.serializer import DeepSeekMessageSerializer
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.schema import SchemaOptimizer
-from browser_use.llm.views import ChatInvokeCompletion
+from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def _usage_from_openai_compatible_completion(resp: Any) -> ChatInvokeUsage | None:
+    """
+    Map an OpenAI-SDK ``chat.completions.create`` response to browser-use's
+    :class:`ChatInvokeUsage` so token accounting / cost estimation work.
+
+    DeepSeek reports cache hits as top-level ``prompt_cache_hit_tokens`` on
+    ``usage``; OpenAI uses ``prompt_tokens_details.cached_tokens`` instead.
+    """
+    raw = getattr(resp, "usage", None)
+    if raw is None:
+        return None
+
+    def _pick_int(obj: Any, *names: str) -> int:
+        for n in names:
+            v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
+            if v is None:
+                continue
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    pt = _pick_int(raw, "prompt_tokens", "input_tokens")
+    ct = _pick_int(raw, "completion_tokens", "output_tokens")
+    tt = _pick_int(raw, "total_tokens")
+    if not (pt or ct or tt):
+        return None
+
+    cached = 0
+    pd = getattr(raw, "prompt_tokens_details", None) if not isinstance(raw, dict) else raw.get("prompt_tokens_details")
+    if isinstance(pd, dict):
+        cached = _pick_int(pd, "cached_tokens")
+    elif pd is not None:
+        cached = _pick_int(pd, "cached_tokens")
+
+    if not cached:
+        cached = _pick_int(raw, "prompt_cache_hit_tokens", "prompt_cached_tokens")
+
+    cached_opt = int(cached) if cached else None
+    if not tt and (pt or ct):
+        tt = pt + ct
+
+    return ChatInvokeUsage(
+        prompt_tokens=pt,
+        prompt_cached_tokens=cached_opt,
+        prompt_cache_creation_tokens=None,
+        prompt_image_tokens=None,
+        completion_tokens=ct,
+        total_tokens=tt,
+    )
 
 
 def _first_structural_index(s: str) -> int:
@@ -399,9 +452,16 @@ class OctopilotChatDeepSeek(ChatDeepSeek):
                     messages=ds_messages,  # type: ignore
                     **common,
                 )
+                usage = _usage_from_openai_compatible_completion(resp)
+                fr = None
+                try:
+                    fr = resp.choices[0].finish_reason  # type: ignore[index]
+                except Exception:
+                    fr = None
                 return ChatInvokeCompletion(
                     completion=resp.choices[0].message.content or "",
-                    usage=None,
+                    usage=usage,
+                    stop_reason=fr,
                 )
             except RateLimitError as e:
                 raise ModelRateLimitError(str(e), model=self.name) from e
@@ -442,6 +502,12 @@ class OctopilotChatDeepSeek(ChatDeepSeek):
                     tool_choice=tool_choice,  # type: ignore
                     **common,
                 )
+                usage = _usage_from_openai_compatible_completion(resp)
+                fr = None
+                try:
+                    fr = resp.choices[0].finish_reason  # type: ignore[index]
+                except Exception:
+                    fr = None
                 msg = resp.choices[0].message
                 if not msg.tool_calls and output_format is not None and hasattr(
                     output_format, "model_json_schema"
@@ -456,7 +522,8 @@ class OctopilotChatDeepSeek(ChatDeepSeek):
                             raise ModelProviderError(str(e), model=self.name) from e
                         return ChatInvokeCompletion(
                             completion=completion,
-                            usage=None,
+                            usage=usage,
+                            stop_reason=fr,
                         )
                 if not msg.tool_calls:
                     raise ValueError("Expected tool_calls in response but got none")
@@ -471,11 +538,13 @@ class OctopilotChatDeepSeek(ChatDeepSeek):
                 if output_format is not None:
                     return ChatInvokeCompletion(
                         completion=_validate_agent_output(output_format, parsed),
-                        usage=None,
+                        usage=usage,
+                        stop_reason=fr,
                     )
                 return ChatInvokeCompletion(
                     completion=parsed,
-                    usage=None,
+                    usage=usage,
+                    stop_reason=fr,
                 )
             except RateLimitError as e:
                 raise ModelRateLimitError(str(e), model=self.name) from e
@@ -499,9 +568,16 @@ class OctopilotChatDeepSeek(ChatDeepSeek):
                     comp = _validate_agent_output(output_format, _json_loads_llm(content))
                 except json.JSONDecodeError as e:
                     raise ModelProviderError(str(e), model=self.name) from e
+                usage = _usage_from_openai_compatible_completion(resp)
+                fr = None
+                try:
+                    fr = resp.choices[0].finish_reason  # type: ignore[index]
+                except Exception:
+                    fr = None
                 return ChatInvokeCompletion(
                     completion=comp,
-                    usage=None,
+                    usage=usage,
+                    stop_reason=fr,
                 )
             except RateLimitError as e:
                 raise ModelRateLimitError(str(e), model=self.name) from e

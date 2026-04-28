@@ -26,6 +26,7 @@ from profiles.profiler import (
     ResolveFieldsParams,
 )
 from .agent_control import TakeoverRequested, get_default as _get_agent_control
+from .form_keyboard import FormKeyboardParams, execute_form_keyboard
 from .llm_usage import LLMUsageRecorder, TokenTrackingLLM
 
 # Enable line editing (arrow keys, history) during interactive prompts.
@@ -614,6 +615,48 @@ def _orch_post_json(path: str, payload: dict[str, Any], *, timeout_s: float = 4.
         return False
 
 
+def _orch_set_machine_attention(*, needed: bool, reason: str | None = None) -> None:
+    """Tell the orchestrator this machine needs human review (or clear the flag)."""
+    mid = (os.getenv("ORCH_MACHINE_ID") or "").strip()
+    if not mid or not (os.getenv("ORCH_API_BASE") or "").strip():
+        return
+    body: dict[str, Any] = {"needed": bool(needed)}
+    if reason:
+        body["reason"] = str(reason).strip()[:400]
+    _orch_post_json(f"/api/machines/{mid}/attention", body, timeout_s=3.0)
+
+
+def _orch_attention_after_agent_run(*, status: str, description: str, final: str | None) -> None:
+    """
+    When the agent stops without a successful application, surface ``needs_human``
+    in the orchestrator (budget / captcha flows already use the same endpoint).
+    """
+    if status != "Failed":
+        return
+    dl = f"{description or ''}\n{final or ''}".lower()
+    if "insufficient_quota" in dl or "exceeded your current quota" in dl or "check your plan and billing" in dl:
+        _orch_set_machine_attention(needed=True, reason="out_of_funds")
+        return
+    reason = "agent_run_failed"
+    if any(
+        k in dl
+        for k in (
+            "[verdict: fail]",
+            "verdict: fail",
+            "not submitted",
+            "pre-submit",
+            "confirm_before_submit",
+            "application was not submitted",
+        )
+    ):
+        reason = "application_not_submitted"
+    elif "consecutive" in dl and ("failure" in dl or "failures" in dl):
+        reason = "agent_stopped_after_errors"
+    elif "done-guard" in dl or "premature `done`" in dl or "premature 'done'" in dl:
+        reason = "premature_done_blocked"
+    _orch_set_machine_attention(needed=True, reason=reason)
+
+
 def _flatten_profile_fields(profile: dict[str, Any]) -> dict[str, Any]:
     """
     Best-effort flatten of the profile into stable dotted keys so we can include
@@ -947,6 +990,8 @@ def _build_task(job_url: str, profile: dict[str, Any]) -> str:
         "not a generic container that might map to the first item (wrong option).\n"
         "  - Virtualized / long lists: scroll **inside the dropdown’s scrollable panel** (pass that element’s index to "
         "`scroll`), not only the main page, until the target label appears in the list you will click.\n"
+        "  - If clicks keep landing on the wrong row or placeholder toggles, switch to **`form_keyboard_step`**: focus "
+        "the combobox/select, use arrow keys + `enter` inside the list, and read the returned `focus` JSON (see below).\n"
         "  - After every click on an option, verify the control now shows the intended value (read the tool result and/or "
         "use `extract`). If it shows a different label, retry with the correct row.\n"
         "  - **CRITICAL — two attempts, then human:** For each dropdown/select (Land, Nationalität, etc.), you get at "
@@ -956,6 +1001,19 @@ def _build_task(job_url: str, profile: dict[str, Any]) -> str:
         "does not stick, you **must** call `request_user_intervention` immediately and describe which control to set; "
         "do not try a third automation pass, and do not loop on Escape/click/wait. The runtime may also pause for the "
         "user after repeated placeholder toggles on the same control.\n"
+        "- KEYBOARD FORM NAVIGATION (`form_keyboard_step` tool):\n"
+        "  - Sends real browser key events (Tab, Shift+Tab, Enter, Escape, Space, arrows) and returns JSON with `focus` "
+        "(active element: tag, labels, aria fields, `value_preview` on `<select>`, `aria_active_descendant` when a "
+        "list highlights a virtualized option).\n"
+        "  - Use when dropdown/combobox clicks miss, element indices are unreliable, or you need deterministic movement "
+        "without reusing stale snapshot indices.\n"
+        "  - **Between fields**: `tab` / `shift_tab` follow the page tab order. **Inside** an opened listbox or "
+        "native `<select>`: prefer `arrow_down` / `arrow_up` (and `enter` to confirm), not Tab — Tab often closes "
+        "the list and jumps away.\n"
+        "  - Always treat the tool's `focus` object as ground truth; do not infer the active field only from how many "
+        "times you repeated a key.\n"
+        "  - Optional: `focus_first_form_field` focuses the first visible control inside a `<form>` (page-wide fallback), "
+        "then read `focus`.\n"
         "- When interacting with CHECKBOXES: after clicking, verify it is actually checked (look for a checked state, aria-checked=true, or UI change).\n"
         "  If the checkbox did not toggle, do NOT keep clicking the outer container.\n"
         "  Instead click the core element: the actual <input type=\"checkbox\"> or the innermost div/span with role=\"checkbox\".\n"
@@ -1511,6 +1569,51 @@ async def _run(
         except Exception:
             pass
         return raw
+
+    @tools.action(
+        description=(
+            "Keyboard-navigate the form: send Tab/Shift+Tab/Enter/Escape/Space/arrow keys to the real browser focus, "
+            "then return JSON with `focus` (active element: labels, select value_preview, aria-activedescendant, etc.). "
+            "Use when dropdown clicks miss or snapshot indices are volatile; use arrows+Enter inside expanded lists; "
+            "use focus_first_form_field to jump to the first form control."
+        ),
+        param_model=FormKeyboardParams,
+    )
+    async def form_keyboard_step(params: FormKeyboardParams) -> Any:
+        try:
+            from browser_use.agent.views import ActionResult  # type: ignore
+        except Exception:
+            ActionResult = None  # type: ignore[misc, assignment]
+
+        a = agent_box.get("agent")
+        browser_session = getattr(a, "browser_session", None) if a else None
+
+        ok, payload, err = await execute_form_keyboard(
+            browser_session,
+            key=params.key,
+            repeat=params.repeat,
+        )
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        if ActionResult is None:
+            if not ok:
+                return f"ERROR: {err}\n{body}"
+            return body
+        if not ok:
+            return ActionResult(
+                success=False,
+                error=err or "form_keyboard_step failed",
+                extracted_content=body,
+                include_in_memory=True,
+            )
+        return ActionResult(
+            success=True,
+            extracted_content=body,
+            include_in_memory=True,
+            long_term_memory=(
+                "Trust the `focus` JSON from form_keyboard_step for what is focused. Inside listboxes/comboboxes, "
+                "prefer arrow keys + enter over Tab. For native selects, use arrows while the control is focused."
+            ),
+        )
 
     @tools.action(description="Ask user for confirmation before submitting/continuing an application step.")
     async def confirm_before_submit(action_description: str) -> str:
@@ -2418,19 +2521,6 @@ async def _run(
                     )
     except Exception as e:
         description = f"{type(e).__name__}: {e}".strip()
-        # Detect "out of funds / insufficient quota" and surface it to the orchestrator UI.
-        try:
-            msg = (str(e) or "").lower()
-            if "insufficient_quota" in msg or "exceeded your current quota" in msg or "check your plan and billing" in msg:
-                mmid = (os.getenv("ORCH_MACHINE_ID") or "").strip()
-                if mmid:
-                    _orch_post_json(
-                        f"/api/machines/{mmid}/attention",
-                        {"needed": True, "reason": "out_of_funds"},
-                        timeout_s=2.0,
-                    )
-        except Exception:
-            pass
         status = "Failed"
     finally:
         stop_telemetry.set()
@@ -2439,6 +2529,8 @@ async def _run(
                 _restore_tracker()
             except Exception:
                 pass
+
+    _orch_attention_after_agent_run(status=status, description=description, final=final)
 
     llm_totals = recorder.totals()
     llm_breakdown = recorder.snapshot()
@@ -2455,7 +2547,7 @@ async def _run(
             "description": description,
             "fields": _form_fields_only(),
             "profile_id": profile_id,
-            "llm_model": (os.getenv("OPENAI_MODEL") or "").strip(),
+            "llm_model": (model_name or "").strip(),
             "llm": {
                 "totals": llm_totals,
                 "by_model": llm_breakdown,

@@ -606,6 +606,13 @@ def extract_token_usage(obj: Any) -> Optional[TokenUsage]:
         ot = _int_or_zero(_get(usage, "output_tokens") or _get(usage, "completion_tokens"))
         tt = _int_or_zero(_get(usage, "total_tokens"))
         ci, rt, ai, ao = _extract_sub_tokens(usage)
+        # browser_use ChatInvokeUsage + DeepSeek flat usage use top-level cache fields.
+        if not ci:
+            ci = _int_or_zero(
+                _get(usage, "prompt_cached_tokens")
+                or _get(usage, "prompt_cache_hit_tokens")
+                or _get(usage, "cached_tokens")
+            )
         if it or ot or tt:
             return TokenUsage(
                 input_tokens=it,
@@ -681,6 +688,7 @@ def _extract_from_dict(d: dict) -> Optional[TokenUsage]:
         ao = _int_or_zero(cd.get("audio_tokens"))
     # Also accept top-level flat sub-fields.
     ci = ci or _int_or_zero(d.get("cached_input_tokens") or d.get("cached_tokens"))
+    ci = ci or _int_or_zero(d.get("prompt_cache_hit_tokens") or d.get("prompt_cached_tokens"))
     rt = rt or _int_or_zero(d.get("reasoning_tokens"))
     ai = ai or _int_or_zero(d.get("audio_input_tokens"))
     ao = ao or _int_or_zero(d.get("audio_output_tokens"))
