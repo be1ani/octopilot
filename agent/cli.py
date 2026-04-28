@@ -920,20 +920,23 @@ def _build_task(job_url: str, profile: dict[str, Any]) -> str:
         "- If you are struggling to perform any task (e.g., repeated retries, can't find an element, blocked by UI state),\n"
         "  call `request_user_intervention` describing what you need the user to do in the browser.\n"
         "- FORM FILLING / SHADOW DOM (avoid re-filling the same fields in a loop):\n"
-        "  - Many application forms render inputs inside **closed or nested Shadow DOM**. Scripts that use "
-        "`document.getElementById`, `querySelector` on the **page root**, or light-DOM IDs often see **no elements** "
-        "or **empty values** even when fields are visible in the browser snapshot and the **`input` action succeeded**.\n"
-        "  - Therefore: if **`input` returned success** for an index, **assume the value was applied** and **do not** call "
-        "`input` again with the **same element index** and the **same text** in this run, unless the URL changed, the step "
-        "reset the form, or a **snapshot/extract** clearly shows that specific field is blank.\n"
-        "  - **Never** conclude \"all fields are empty\" solely from an `evaluate` script that walks normal DOM IDs — that "
-        "false negative triggers useless repeat fills. Prefer **`extract`** (e.g. \"What text appears in the first name / "
-        "Vorname field?\") or the **current interactive snapshot**, not `getElementById('field-firstName')`-style checks.\n"
-        "  - After filling a batch of text fields once successfully, **move on** to dropdowns, checkboxes, uploads, and "
-        "`resolve_fields` — do **not** chain multiple `wait` steps only to \"verify\" via broken DOM queries, then re-type "
-        "the same data.\n"
-        "  - If stuck between contradictory signals (input says OK, evaluate says empty), treat it as **Shadow DOM mismatch**: "
-        "continue the workflow; use `request_user_intervention` only if you cannot operate a required control at all.\n"
+        "  - Many application forms render inputs inside **closed or nested Shadow DOM**. The `extract` and `evaluate` "
+        "tools read **visible page text and light-DOM**, so they CANNOT reliably read what is currently typed into a "
+        "form input. They will routinely report a filled field as `(empty)` even though the value is set.\n"
+        "  - **HARD RULE**: if an `input` action returned success for an element index, the field IS filled. Trust it. "
+        "Do NOT call `input` again with the **same index** and the **same text** in this run — the orchestrator will "
+        "reject the duplicate as a no-op and tell you to move on. The only valid reason to re-type is a URL change or "
+        "an explicit form reset visible in the page (e.g. the form was wiped after a navigation).\n"
+        "  - **Do NOT** use `extract`, `evaluate`, `find_elements`, or any DOM script to \"verify\" the contents of "
+        "text inputs you just filled. Those tools are for reading page content, not input state. If you absolutely "
+        "need a visual sanity check, use `screenshot` once — never as a loop guard.\n"
+        "  - After filling a batch of text fields once successfully, **move on immediately** to dropdowns, checkboxes, "
+        "uploads, `resolve_fields`, and `confirm_before_submit`. Do not chain `wait` / `extract` / `evaluate` steps to "
+        "double-check what you just typed.\n"
+        "  - If contradictory signals appear (input says OK, extract/evaluate says empty), treat it as a Shadow-DOM "
+        "false negative and continue the workflow. If you genuinely cannot proceed because a real validation error "
+        "blocks submission, read the page for **validation messages** (not input contents) via `extract` with a query "
+        "like \"List all visible form validation errors and which field they refer to\".\n"
         "- DROPDOWNS / SELECT / custom option lists (country, city, etc.):\n"
         "  - Element indices in the browser snapshot are volatile: after any scroll, wait, failed click, or DOM update, "
         "they may change. Do not reuse an index from an earlier step; refresh your picture of the page first.\n"
@@ -946,9 +949,13 @@ def _build_task(job_url: str, profile: dict[str, Any]) -> str:
         "`scroll`), not only the main page, until the target label appears in the list you will click.\n"
         "  - After every click on an option, verify the control now shows the intended value (read the tool result and/or "
         "use `extract`). If it shows a different label, retry with the correct row.\n"
-        "  - If a dropdown still cannot be set after a few honest retries (e.g. shadow-DOM widget you cannot operate, "
-        "options never appear, control keeps reverting), call `request_user_intervention` and ask the user to set that "
-        "single control in the browser — then resume.\n"
+        "  - **CRITICAL — two attempts, then human:** For each dropdown/select (Land, Nationalität, etc.), you get at "
+        "most **two complete attempts** to set it (open → pick the correct row → verify the closed control shows the "
+        "intended value). **Attempt 1** fails if verification shows the wrong label or still a placeholder like "
+        "\"Auswählen\". **Attempt 2** is exactly one more full try with fresh indices/scrolling. If attempt 2 still "
+        "does not stick, you **must** call `request_user_intervention` immediately and describe which control to set; "
+        "do not try a third automation pass, and do not loop on Escape/click/wait. The runtime may also pause for the "
+        "user after repeated placeholder toggles on the same control.\n"
         "- When interacting with CHECKBOXES: after clicking, verify it is actually checked (look for a checked state, aria-checked=true, or UI change).\n"
         "  If the checkbox did not toggle, do NOT keep clicking the outer container.\n"
         "  Instead click the core element: the actual <input type=\"checkbox\"> or the innermost div/span with role=\"checkbox\".\n"
@@ -1688,6 +1695,281 @@ async def _run(
         registered.function = guarded_done  # type: ignore[assignment]
 
     _install_done_guard()
+
+    def _install_input_dedup_guard() -> None:
+        """
+        Wrap the built-in `input` action so the agent cannot re-fill the same
+        text into the same field on the same URL.
+
+        Symptom we're fixing (this run, log...): the model successfully fills
+        every text input in the form, then either (a) loses the action list to
+        an LLM-output validation error and restarts the step from scratch, or
+        (b) calls `extract` / `evaluate` to "verify" the values, which on
+        Shadow-DOM application forms reports every input as **(empty)** even
+        though the value is actually applied. The model interprets that false
+        negative as proof the fields are blank and re-types every value — the
+        whole batch is replayed multiple times in a row, wasting tokens and
+        often jumping focus around or breaking the form.
+
+        Policy:
+          - Track every (url, element_index, normalized_text) triple that has
+            already been typed successfully in this run.
+          - When the agent calls `input` with a triple we've already seen,
+            short-circuit: return a *successful* ActionResult that tells the
+            agent "this field is already filled, move on", without poking the
+            browser again.
+          - Identical short strings (<2 chars) are not deduped — they're more
+            likely to legitimately repeat across unrelated controls.
+        """
+        try:
+            from browser_use.agent.views import ActionResult  # type: ignore
+        except Exception:
+            return
+
+        actions = getattr(getattr(tools, "registry", None), "registry", None)
+        actions = getattr(actions, "actions", None) if actions is not None else None
+        if not isinstance(actions, dict) or "input" not in actions:
+            return
+
+        registered_input = actions["input"]
+        original_input_fn = getattr(registered_input, "function", None)
+        if not callable(original_input_fn):
+            return
+
+        history: list[tuple[str, int, str]] = []
+        _MAX_HISTORY = 128
+
+        def _norm(s: str) -> str:
+            return (s or "").strip().casefold()
+
+        async def _safe_current_url(browser_session: Any) -> str:
+            if browser_session is None:
+                return ""
+            getter = getattr(browser_session, "get_current_page_url", None)
+            if not callable(getter):
+                return ""
+            try:
+                v = await getter()
+                return str(v or "")
+            except Exception:
+                return ""
+
+        async def guarded_input(**kwargs: Any) -> Any:
+            params = kwargs.get("params")
+            if params is None:
+                return await original_input_fn(**kwargs)
+
+            text_raw = getattr(params, "text", "") or ""
+            try:
+                index = int(getattr(params, "index", -1) or -1)
+            except Exception:
+                index = -1
+
+            if index < 0 or len(text_raw.strip()) < 2:
+                return await original_input_fn(**kwargs)
+
+            norm = _norm(text_raw)
+            url = await _safe_current_url(kwargs.get("browser_session"))
+
+            for past_url, past_idx, past_text in history:
+                if past_idx == index and past_text == norm and past_url == url:
+                    msg = (
+                        f"Skipped duplicate input: the value {text_raw!r} was "
+                        f"already typed into element index {index} on this page "
+                        "earlier in this run. The first `input` succeeded; the "
+                        "field is filled. DO NOT call `input` again with the "
+                        "same index and the same text. DO NOT use `extract` or "
+                        "`evaluate` to verify input-field contents — application "
+                        "forms commonly render inputs in Shadow DOM and those "
+                        "tools will report (empty) even when the value is set. "
+                        "If you really need a sanity check, take a `screenshot`. "
+                        "Otherwise move on to the next pending control: "
+                        "dropdown, checkbox, file upload, `resolve_fields`, or "
+                        "`confirm_before_submit`."
+                    )
+                    print(
+                        "\n\033[1;33m[input-dedup]\033[0m duplicate input "
+                        f"blocked (index={index}, text={text_raw!r}). Telling "
+                        "the agent to move on.\n"
+                    )
+                    return ActionResult(
+                        success=True,
+                        extracted_content=(
+                            f"Skipped duplicate input for index {index} "
+                            f"(value already typed)."
+                        ),
+                        long_term_memory=msg,
+                        include_in_memory=True,
+                    )
+
+            result = await original_input_fn(**kwargs)
+            try:
+                errored = bool(getattr(result, "error", None))
+            except Exception:
+                errored = False
+            if not errored:
+                history.append((url, index, norm))
+                if len(history) > _MAX_HISTORY:
+                    del history[: len(history) - _MAX_HISTORY]
+            return result
+
+        registered_input.function = guarded_input  # type: ignore[assignment]
+
+    _install_input_dedup_guard()
+
+    def _install_dropdown_intervention_guard() -> None:
+        """
+        If the agent clicks the same placeholder-style dropdown trigger (e.g. "Auswählen")
+        twice on the same URL/index without selecting a list option in between, pause for
+        human intervention. Matches the policy: after the second failed handling attempt,
+        the user must set the control so automation does not spin in dropdown loops.
+        """
+        try:
+            from browser_use.agent.views import ActionResult  # type: ignore
+        except Exception:
+            return
+
+        actions = getattr(getattr(tools, "registry", None), "registry", None)
+        actions = getattr(actions, "actions", None) if actions is not None else None
+        if not isinstance(actions, dict) or "click" not in actions:
+            return
+
+        registered = actions["click"]
+        original_fn = getattr(registered, "function", None)
+        if not callable(original_fn):
+            return
+
+        try:
+            threshold = int(os.getenv("AGENT_DROPDOWN_PLACEHOLDER_CLICKS_FOR_HUMAN", "2") or 2)
+        except ValueError:
+            threshold = 2
+        threshold = max(2, threshold)
+
+        # (page_url, element_index) -> consecutive placeholder-toggle clicks
+        toggle_counts: dict[tuple[str, int], int] = {}
+
+        # Button labels that mean "no selection yet" (expand as needed).
+        _PLACEHOLDER_SUBSTR = (
+            "auswählen",
+            "bitte wählen",
+            "please select",
+            "select...",
+            "choose...",
+            "wählen sie",
+            "select an option",
+            "-- select",
+        )
+
+        def _click_describes_option_pick(content: str) -> bool:
+            c = content.casefold()
+            if "clicked li" in c:
+                return True
+            if "clicked option" in c:
+                return True
+            if "role='option'" in c or '[role="option"]' in c:
+                return True
+            return False
+
+        def _click_describes_placeholder_toggle(content: str) -> bool:
+            """True if this looks like clicking a closed combobox that still shows a placeholder label."""
+            if not content or _click_describes_option_pick(content):
+                return False
+            c = content.casefold()
+            if "clicked button" not in c and "clicked combobox" not in c:
+                return False
+            # Quoted control label in tool output, e.g. Clicked button "Auswählen"
+            part = content
+            for token in ('"', "\u201c", "\u201d"):
+                part = part.replace(token, '"')
+            lower = part.casefold()
+            for sub in _PLACEHOLDER_SUBSTR:
+                if sub in lower:
+                    return True
+            return False
+
+        async def _safe_current_url(browser_session: Any) -> str:
+            if browser_session is None:
+                return ""
+            getter = getattr(browser_session, "get_current_page_url", None)
+            if not callable(getter):
+                return ""
+            try:
+                v = await getter()
+                return str(v or "")
+            except Exception:
+                return ""
+
+        async def guarded_click(**kwargs: Any) -> Any:
+            result = await original_fn(**kwargs)
+            try:
+                content = str(getattr(result, "extracted_content", "") or "")
+            except Exception:
+                content = ""
+
+            params = kwargs.get("params")
+            try:
+                index = int(getattr(params, "index", -1) or -1) if params is not None else -1
+            except Exception:
+                index = -1
+
+            url = await _safe_current_url(kwargs.get("browser_session"))
+
+            if _click_describes_option_pick(content):
+                for k in list(toggle_counts.keys()):
+                    if k[0] == url:
+                        del toggle_counts[k]
+                return result
+
+            if index < 0 or not _click_describes_placeholder_toggle(content):
+                return result
+
+            key = (url, index)
+            toggle_counts[key] = toggle_counts.get(key, 0) + 1
+            if toggle_counts[key] < threshold:
+                return result
+
+            toggle_counts[key] = 0
+            orch_msg = (
+                "The agent clicked the same dropdown trigger twice without choosing an option (or the selection "
+                "did not apply). Set this control manually in the browser, then continue."
+            )
+            term_banner = (
+                "\n\033[1;31mDropdown handling failed after repeated tries on the same control.\033[0m\n"
+                "Please open the dropdown in the browser window, choose the correct value, and close it.\n"
+                "Then press Enter here to resume automation.\n"
+            )
+            print(
+                "\n\033[1;33m[dropdown-guard]\033[0m placeholder toggles reached threshold "
+                f"(url={url[:80]!r}…, index={index}, threshold={threshold}). Pausing for human.\n"
+            )
+            try:
+                await asyncio.to_thread(
+                    _human_checkpoint_sync,
+                    orch_message=orch_msg,
+                    terminal_banner=term_banner,
+                    terminal_prompt="\n\033[1;33mPress Enter to continue...\033[0m ",
+                )
+            except Exception:
+                pass
+
+            return ActionResult(
+                success=True,
+                extracted_content=(
+                    f"{content}\n\n[dropdown-guard] Human checkpoint completed after {threshold} placeholder "
+                    "toggles on this control. Re-read the page and continue; call `request_user_intervention` "
+                    "yourself if it still cannot be set automatically."
+                ),
+                include_in_memory=True,
+                long_term_memory=(
+                    "You hit the maximum automated tries for this dropdown trigger. The user was asked to set the "
+                    "control manually. Read the current UI state and continue with the next fields; do not repeat "
+                    "the same open/close click loop."
+                ),
+            )
+
+        registered.function = guarded_click  # type: ignore[assignment]
+
+    _install_dropdown_intervention_guard()
 
     @tools.action(
         description=(
