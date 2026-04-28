@@ -508,7 +508,8 @@
 }
 
 .modal-field input,
-.modal-field select {
+.modal-field select,
+.modal-field textarea {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -518,12 +519,28 @@
   width: 100%;
 }
 
+.modal-field textarea.modal-urls-input {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  resize: vertical;
+  min-height: 6.5rem;
+}
+
+.modal-field .modal-field-hint {
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
 .modal-field select {
   cursor: pointer;
 }
 
 .modal-field input:focus,
-.modal-field select:focus {
+.modal-field select:focus,
+.modal-field textarea:focus {
   outline: none;
   border-color: rgba(56, 189, 248, 0.45);
   box-shadow: 0 0 0 2px var(--accent-dim);

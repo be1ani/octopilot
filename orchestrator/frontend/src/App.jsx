@@ -186,17 +186,56 @@ export default function App() {
   }, [outOfFundsMachines, refresh]);
 
   const onStart = async (payload) => {
+    const { url, urls, ...rest } = payload;
+    const list = Array.isArray(urls) && urls.length
+      ? urls.map((u) => String(u || "").trim()).filter(Boolean)
+      : String(url || "")
+          .trim()
+          ? [String(url).trim()]
+          : [];
+    if (!list.length) return false;
+
     setError(null);
-    try {
-      await fetchJson("/api/machines", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
-      await refresh();
-    } catch (e) {
-      setError(e.message || String(e));
-      throw e;
+    const bodyFor = (u) => JSON.stringify({ ...rest, url: u });
+
+    if (list.length === 1) {
+      try {
+        await fetchJson("/api/machines", {
+          method: "POST",
+          body: bodyFor(list[0]),
+        });
+        await refresh();
+        return true;
+      } catch (e) {
+        setError(e.message || String(e));
+        return false;
+      }
     }
+
+    const results = await Promise.allSettled(
+      list.map((u) =>
+        fetchJson("/api/machines", {
+          method: "POST",
+          body: bodyFor(u),
+        })
+      )
+    );
+    await refresh();
+
+    const failed = results.filter((r) => r.status === "rejected");
+    if (failed.length) {
+      const msgs = failed.map((r) => r.reason?.message || String(r.reason));
+      const uniq = [...new Set(msgs)];
+      const tail = uniq.length > 2 ? "…" : "";
+      const detail = uniq.slice(0, 2).join("; ") + tail;
+      setError(
+        failed.length === list.length
+          ? detail
+          : `${failed.length} of ${list.length} failed: ${detail}`
+      );
+      return false;
+    }
+    return true;
   };
 
   const onStop = async (id) => {

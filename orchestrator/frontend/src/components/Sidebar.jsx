@@ -88,18 +88,26 @@ export function Sidebar({
     return () => window.removeEventListener("keydown", onKey);
   }, [startModalOpen]);
 
+  const urlLines = url
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const bulkCount = urlLines.length;
+
   const submit = async (e) => {
     e.preventDefault();
-    if (!url.trim()) return;
+    if (!bulkCount) return;
     setBusy(true);
     try {
-      await onStart({
-        url: url.trim(),
+      const ok = await onStart({
+        urls: urlLines,
         llm_model: llmModel,
         ...(profileId.trim() ? { profile_id: profileId.trim() } : {}),
       });
-      setUrl("");
-      setStartModalOpen(false);
+      if (ok) {
+        setUrl("");
+        setStartModalOpen(false);
+      }
     } finally {
       setBusy(false);
     }
@@ -121,7 +129,7 @@ export function Sidebar({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="modal-head">
-          <h2 id="start-job-modal-title">Start machine</h2>
+          <h2 id="start-job-modal-title">{bulkCount > 1 ? "Start machines" : "Start machine"}</h2>
           <button
             type="button"
             className="modal-close"
@@ -133,16 +141,20 @@ export function Sidebar({
         </div>
         <form className="modal-form" onSubmit={submit}>
           <label className="modal-field">
-            <span>Job application URL</span>
-            <input
-              type="url"
-              name="url"
-              placeholder="https://…"
+            <span>Job application URLs</span>
+            <textarea
+              name="urls"
+              className="modal-urls-input"
+              placeholder={"https://example.com/job/one\nhttps://example.com/job/two"}
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              required
+              rows={5}
+              aria-describedby="start-job-urls-hint"
               autoFocus
             />
+            <span id="start-job-urls-hint" className="modal-field-hint">
+              One URL per line. Multiple jobs are started in parallel (same profile and model).
+            </span>
           </label>
           <label className="modal-field">
             <span>Profile</span>
@@ -185,8 +197,8 @@ export function Sidebar({
             >
               Cancel
             </button>
-            <button type="submit" className="btn primary" disabled={busy || !health?.docker}>
-              {busy ? "Starting…" : "Start agent"}
+            <button type="submit" className="btn primary" disabled={busy || !bulkCount || !health?.docker}>
+              {busy ? "Starting…" : bulkCount > 1 ? `Start ${bulkCount} jobs` : "Start job"}
             </button>
           </div>
         </form>

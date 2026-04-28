@@ -44,6 +44,22 @@ services:
     ports:
       - "5050:5050"
 
+  job-board:
+    build:
+      context: .
+      dockerfile: job_board/Dockerfile
+    image: octopilot-job-board:latest
+    container_name: octopilot-job-board
+    restart: unless-stopped
+    environment:
+      JOB_BOARD_PORT: "5060"
+      JOB_BOARD_MONGO_URI: "mongodb://master-database:27017"
+      JOB_BOARD_DB_NAME: "job_board_db"
+    depends_on:
+      - master-database
+    ports:
+      - "5060:5060"
+
   orchestrator-frontend:
     build:
       context: .
@@ -55,6 +71,19 @@ services:
       - orchestrator-backend
     ports:
       - "5080:8080"
+
+  job-board-ui:
+    build:
+      context: .
+      dockerfile: job_board-ui/Dockerfile
+    image: octopilot-job-board-ui:latest
+    container_name: octopilot-job-board-ui
+    restart: unless-stopped
+    depends_on:
+      - job-board
+      - orchestrator-backend
+    ports:
+      - "5070:8080"
 
 volumes:
   master_database_data:
