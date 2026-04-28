@@ -523,6 +523,47 @@
   border-radius: 0 0 4px 4px;
 }
 
+.machine-bottom-stack {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.machine-bottom-tablist {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  background: rgba(15, 23, 42, 0.88);
+}
+
+.machine-bottom-tab {
+  flex: 1;
+  border: none;
+  border-right: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.65rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 0.3rem 0.35rem;
+  cursor: pointer;
+}
+
+.machine-bottom-tab:last-child {
+  border-right: none;
+}
+
+.machine-bottom-tab--active {
+  background: rgba(56, 189, 248, 0.14);
+  color: #e0f2fe;
+}
+
+.machine-human-input-shell {
+  border-radius: 0 0 4px 4px;
+}
+
 .desktop-lock-overlay {
   position: absolute;
   left: 0;

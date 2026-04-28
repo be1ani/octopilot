@@ -92,8 +92,17 @@ def normalize_base_address(applicant_obj: dict[str, Any]) -> None:
                 base["address"] = ", ".join(bits)
 
 
-def hoist_resume_path_from_base(applicant_obj: dict[str, Any]) -> None:
-    """Some edits mistakenly nest resume_path under base; Profile expects it at the top level."""
+def strip_legacy_top_level_fields(applicant_obj: dict[str, Any]) -> None:
+    """
+    Drop fields that older profile JSON may carry but which the current Profile
+    model no longer accepts (extra="forbid"). Keeps loads from blowing up on
+    legacy data without doing any data migration.
+
+    Drops:
+      - top-level `resume_path` (or `base.resume_path`): replaced by profile.attachments
+      - `other.custom.documents`: replaced by profile.attachments
+    """
+    legacy_top_level = ("resume_path",)
     profiles = applicant_obj.get("profiles")
     if not isinstance(profiles, dict):
         return
@@ -101,11 +110,16 @@ def hoist_resume_path_from_base(applicant_obj: dict[str, Any]) -> None:
         if not isinstance(prof, dict):
             continue
         base = prof.get("base")
-        if not isinstance(base, dict):
-            continue
-        rp = base.pop("resume_path", None)
-        if isinstance(rp, str) and rp.strip() and not prof.get("resume_path"):
-            prof["resume_path"] = rp.strip()
+        if isinstance(base, dict):
+            for k in legacy_top_level:
+                base.pop(k, None)
+        for k in legacy_top_level:
+            prof.pop(k, None)
+        other = prof.get("other")
+        if isinstance(other, dict):
+            custom = other.get("custom")
+            if isinstance(custom, dict):
+                custom.pop("documents", None)
 
 
 def unwrap_described_fields(obj: Any) -> Any:
@@ -171,7 +185,7 @@ class ProfileStore:
                     # Normalize legacy edits inside the profile blob.
                     coerce_base_full_name_to_string({"profiles": {pid: prof_obj}})
                     normalize_base_address({"profiles": {pid: prof_obj}})
-                    hoist_resume_path_from_base({"profiles": {pid: prof_obj}})
+                    strip_legacy_top_level_fields({"profiles": {pid: prof_obj}})
                     out[pid] = Profile.model_validate(prof_obj)
             return out
 
@@ -180,7 +194,7 @@ class ProfileStore:
                 continue
             coerce_base_full_name_to_string({"profiles": {pid: prof_obj}})
             normalize_base_address({"profiles": {pid: prof_obj}})
-            hoist_resume_path_from_base({"profiles": {pid: prof_obj}})
+            strip_legacy_top_level_fields({"profiles": {pid: prof_obj}})
             out[pid] = Profile.model_validate(prof_obj)
         return out
 
@@ -212,6 +226,10 @@ class OrchestratorProfileStore:
         prof = data.get("profile") if isinstance(data, dict) else None
         if not isinstance(prof, dict):
             raise KeyError(f"Profile not found: {profile_id}")
+        # Be tolerant of legacy keys stored on older profile documents (the active
+        # model declares extra="forbid", so any stale field would otherwise trip
+        # validation).
+        strip_legacy_top_level_fields({"profiles": {profile_id: prof}})
         return Profile.model_validate(prof)
 
     def upsert_profile(self, profile: Profile) -> None:

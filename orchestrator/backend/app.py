@@ -203,41 +203,32 @@ def _read_terminal_log(mid: str) -> tuple[str, bool, int]:
 
 def append_application_record(record: dict[str, Any]) -> None:
     """
-    Append a single JSONL record.
-    Best-effort durable: fsync after write.
+    Persist a single application record.
     """
-    p = _applications_path()
-    line = json.dumps(record, ensure_ascii=False)
-    with p.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except Exception:
-            pass
+    try:
+        coll = _applications_coll()
+        doc = dict(record or {})
+        # Ensure id exists so updates can target it.
+        if "id" not in doc or not str(doc.get("id") or "").strip():
+            doc["id"] = str(uuid.uuid4())
+        # Normalize ts for sorting.
+        if "ts" not in doc and isinstance(doc.get("created_at"), (int, float)):
+            doc["ts"] = float(doc["created_at"])
+        if "ts" not in doc:
+            doc["ts"] = time.time()
+        coll.update_one({"id": doc["id"]}, {"$set": doc}, upsert=True)
+    except PyMongoError:
+        # Best-effort: app records should never crash the main loop.
+        return
 
 
 def read_application_records(limit: int = 500) -> list[dict[str, Any]]:
-    p = _applications_path()
-    if not p.is_file():
-        return []
     try:
-        raw_lines = p.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        coll = _applications_coll()
+        cur = coll.find({}, {"_id": 0}).sort([("ts", -1)]).limit(max(1, int(limit or 500)))
+        return [doc for doc in cur if isinstance(doc, dict)]
+    except PyMongoError:
         return []
-    out: list[dict[str, Any]] = []
-    # Read from end (newest first)
-    for line in reversed(raw_lines[-max(1, limit) :]):
-        s = (line or "").strip()
-        if not s:
-            continue
-        try:
-            obj = json.loads(s)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            out.append(obj)
-    return out
 
 
 _applications_lock = threading.RLock()
@@ -246,6 +237,76 @@ _applications_lock = threading.RLock()
 _profiles_lock = threading.RLock()
 _mongo_lock = threading.RLock()
 _mongo_client: MongoClient | None = None
+
+
+def _orch_state_collection_name() -> str:
+    return (os.environ.get("ORCH_STATE_COLLECTION") or "").strip() or "orch_state"
+
+
+def _orch_applications_collection_name() -> str:
+    return (os.environ.get("ORCH_APPLICATIONS_COLLECTION") or "").strip() or "applications"
+
+
+def _orch_llm_ledger_collection_name() -> str:
+    return (os.environ.get("ORCH_LLM_LEDGER_COLLECTION") or "").strip() or "llm_ledger"
+
+
+def _orch_human_input_collection_name() -> str:
+    return (os.environ.get("ORCH_HUMAN_INPUT_COLLECTION") or "").strip() or "human_input_requests"
+
+
+def _human_input_poll_hint_s(created_at: float) -> float:
+    """Match agent-side backoff (caps at 5s) for UI display."""
+    e = max(0.0, time.time() - float(created_at))
+    if e < 15.0:
+        return 0.25
+    if e < 30.0:
+        return 0.5
+    if e < 60.0:
+        return 1.0
+    if e < 120.0:
+        return 2.0
+    return 5.0
+
+
+def _human_input_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    coll = db[_orch_human_input_collection_name()]
+    try:
+        coll.create_index([("machine_id", 1), ("status", 1)], name="machine_status")
+        coll.create_index([("created_at", -1)], name="created_desc")
+    except PyMongoError:
+        pass
+    return coll
+
+
+def _state_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    return db[_orch_state_collection_name()]
+
+
+def _applications_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    coll = db[_orch_applications_collection_name()]
+    try:
+        coll.create_index([("id", 1)], unique=True, name="app_id_unique")
+        coll.create_index([("ts", -1)], name="ts_desc")
+        coll.create_index([("machine_id", 1), ("ts", -1)], name="machine_ts")
+    except PyMongoError:
+        pass
+    return coll
+
+
+def _llm_ledger_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    coll = db[_orch_llm_ledger_collection_name()]
+    try:
+        coll.create_index([("ts", -1)], name="ts_desc")
+        coll.create_index([("machine_id", 1), ("ts", -1)], name="machine_ts")
+        coll.create_index([("model", 1), ("ts", -1)], name="model_ts")
+    except PyMongoError:
+        pass
+    return coll
 
 
 def _orch_mongo_uri() -> str:
@@ -261,6 +322,263 @@ def _orch_mongo_db_name() -> str:
 
 def _orch_profiles_collection_name() -> str:
     return (os.environ.get("ORCH_PROFILES_COLLECTION") or "").strip() or "profiles"
+
+
+def _orch_llm_providers_collection_name() -> str:
+    return (os.environ.get("ORCH_LLM_PROVIDERS_COLLECTION") or "").strip() or "llm_providers"
+
+
+# Catalog of LLM providers the UI knows how to add. The order here is the
+# order the dropdown shows; `env_var` is what gets injected into agent
+# containers as -e flags so the per-job code (browser-use, langchain, etc.)
+# can pick the credential up. `model_prefixes` is used to bucket entries from
+# agent/pricing.json by provider so the table can show their per-model cost.
+# `agent_provider` is the value the agent process expects in
+# `AGENT_LLM_PROVIDER` (see `_make_agent_llm` in agent/cli.py).
+# `model_env_var` is the per-provider env var the agent reads to pick the
+# specific model id (e.g. OPENAI_MODEL, DEEPSEEK_MODEL, …).
+LLM_PROVIDER_REGISTRY: list[dict[str, Any]] = [
+    {
+        "id": "openai",
+        "label": "OpenAI",
+        "env_var": "OPENAI_API_KEY",
+        "model_prefixes": ("gpt-", "o1", "o3", "o4", "chatgpt-", "text-embedding-", "computer-use-"),
+        "agent_provider": "openai",
+        "model_env_var": "OPENAI_MODEL",
+    },
+    {
+        "id": "openai-admin",
+        "label": "OpenAI Admin (usage reconciliation)",
+        "env_var": "OPENAI_ADMIN_KEY",
+        "model_prefixes": (),
+        # Reconciliation-only credential: never selectable as an agent
+        # provider.
+        "agent_provider": None,
+        "model_env_var": None,
+    },
+    {
+        "id": "anthropic",
+        "label": "Claude (Anthropic)",
+        "env_var": "ANTHROPIC_API_KEY",
+        "model_prefixes": ("claude",),
+        "agent_provider": "anthropic",
+        "model_env_var": "ANTHROPIC_MODEL",
+    },
+    {
+        "id": "google",
+        "label": "Google (Gemini)",
+        "env_var": "GOOGLE_API_KEY",
+        "model_prefixes": ("gemini",),
+        "agent_provider": "google",
+        "model_env_var": "GOOGLE_MODEL",
+    },
+    {
+        "id": "deepseek",
+        "label": "DeepSeek",
+        "env_var": "DEEPSEEK_API_KEY",
+        "model_prefixes": ("deepseek-",),
+        "agent_provider": "deepseek",
+        "model_env_var": "DEEPSEEK_MODEL",
+    },
+    {
+        "id": "browser-use",
+        "label": "Browser-Use",
+        "env_var": "BROWSER_USE_API_KEY",
+        "model_prefixes": ("bu-",),
+        "agent_provider": "browser_use",
+        "model_env_var": "BROWSER_USE_MODEL",
+    },
+]
+
+LLM_PROVIDER_INDEX: dict[str, dict[str, Any]] = {p["id"]: p for p in LLM_PROVIDER_REGISTRY}
+
+
+def _llm_providers_coll() -> Collection:
+    db = _mongo()[_orch_mongo_db_name()]
+    coll = db[_orch_llm_providers_collection_name()]
+    try:
+        coll.create_index([("provider", 1)], unique=True, name="provider_unique")
+    except PyMongoError:
+        pass
+    return coll
+
+
+def _mask_api_key(key: str) -> str:
+    s = (key or "").strip()
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return "•" * len(s)
+    return f"{s[:4]}…{s[-4:]}"
+
+
+def _provider_for_model(model_id: str) -> str | None:
+    """Match a pricing.json model id to a registry provider id."""
+    s = (model_id or "").strip().lower()
+    if not s:
+        return None
+    for p in LLM_PROVIDER_REGISTRY:
+        for prefix in p.get("model_prefixes") or ():
+            if s.startswith(prefix):
+                return p["id"]
+    return None
+
+
+def _load_pricing_json() -> dict[str, Any]:
+    """Read agent/pricing.json (host-side) for read-only display."""
+    p = REPO_ROOT / "agent" / "pricing.json"
+    if not p.is_file():
+        return {}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _models_for_provider(provider_id: str) -> list[dict[str, Any]]:
+    """Return [{id, usd_per_1m_input, usd_per_1m_output, ...}] for one provider."""
+    pricing = _load_pricing_json()
+    models = pricing.get("models")
+    if not isinstance(models, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for model_id, info in models.items():
+        if not isinstance(info, dict):
+            continue
+        if _provider_for_model(model_id) != provider_id:
+            continue
+        row = {"id": model_id}
+        for k in ("usd_per_1m_input", "usd_per_1m_output", "usd_per_1m_cached_input"):
+            v = info.get(k)
+            if isinstance(v, (int, float)):
+                row[k] = float(v)
+        rows.append(row)
+    rows.sort(key=lambda r: r["id"])
+    return rows
+
+
+def _ledger_spend_by_provider(*, ledger_rel: str, max_lines: int = 20000) -> dict[str, float]:
+    """Sum cost_usd from the JSONL ledger, grouped by `provider` field."""
+    ledger_path, _ = _mountable_paths(ledger_rel)
+    if not ledger_path.is_file():
+        return {}
+    totals: dict[str, float] = {}
+    for line in _tail_lines(ledger_path, max_lines=max_lines, max_bytes=8_000_000):
+        s = (line or "").strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        prov = str(obj.get("provider") or "").strip()
+        cost = obj.get("cost_usd")
+        if not prov or not isinstance(cost, (int, float)):
+            continue
+        totals[prov] = totals.get(prov, 0.0) + float(cost)
+    return totals
+
+
+def _serialize_llm_provider(
+    doc: dict[str, Any],
+    *,
+    spend_index: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Build the public (key-redacted) view of a stored provider doc."""
+    pid = str(doc.get("provider") or doc.get("_id") or "").strip()
+    meta = LLM_PROVIDER_INDEX.get(pid) or {"id": pid, "label": pid, "env_var": "", "model_prefixes": ()}
+    api_key = str(doc.get("api_key") or "")
+    spend = float((spend_index or {}).get(pid, 0.0)) if spend_index else 0.0
+    return {
+        "provider": pid,
+        "label": meta.get("label") or pid,
+        "env_var": meta.get("env_var") or "",
+        "key_set": bool(api_key),
+        "key_masked": _mask_api_key(api_key),
+        "key_last4": api_key[-4:] if len(api_key) >= 4 else "",
+        "key_length": len(api_key),
+        "models": _models_for_provider(pid),
+        "spend_usd": round(spend, 6),
+        "updated_at": doc.get("updated_at"),
+        "created_at": doc.get("created_at"),
+    }
+
+
+def _list_llm_providers_public(spend_index: dict[str, float] | None = None) -> list[dict[str, Any]]:
+    coll = _llm_providers_coll()
+    docs = list(coll.find({}, {"provider": 1, "api_key": 1, "created_at": 1, "updated_at": 1}))
+    if spend_index is None:
+        with _state_lock:
+            data = load_state()
+            settings = _get_settings(data)
+            ledger_rel = (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL).strip()
+        spend_index = _ledger_spend_by_provider(ledger_rel=ledger_rel)
+    return [_serialize_llm_provider(d, spend_index=spend_index) for d in docs]
+
+
+def _get_llm_provider_key(provider_id: str) -> str:
+    """Look up the plaintext API key for a configured provider, or '' if absent."""
+    pid = (provider_id or "").strip().lower()
+    if not pid:
+        return ""
+    try:
+        coll = _llm_providers_coll()
+        doc = coll.find_one({"provider": pid}, {"api_key": 1})
+    except PyMongoError:
+        return ""
+    if not doc:
+        return ""
+    return str(doc.get("api_key") or "").strip()
+
+
+def _llm_provider_env_args() -> list[str]:
+    """
+    Build the -e <NAME>=<VALUE> argument list for `docker run`, sourced from
+    every provider configured in Mongo. Returns an empty list when no keys
+    are stored (agents will then fail loudly when they need a key, which is
+    the intended UX after the .env mount was removed).
+    """
+    args: list[str] = []
+    try:
+        coll = _llm_providers_coll()
+        docs = list(coll.find({}, {"provider": 1, "api_key": 1}))
+    except PyMongoError:
+        return args
+    for d in docs:
+        pid = str(d.get("provider") or "").strip()
+        meta = LLM_PROVIDER_INDEX.get(pid)
+        if not meta or not meta.get("env_var"):
+            continue
+        key = str(d.get("api_key") or "").strip()
+        if not key:
+            continue
+        args.extend(["-e", f"{meta['env_var']}={key}"])
+    return args
+
+
+def _agent_runtime_env_for_model(llm_model: str) -> list[str]:
+    """
+    Build the `-e AGENT_LLM_PROVIDER=...` and `-e <PROVIDER>_MODEL=...` flags
+    for an agent container based on the user-selected ``llm_model``.
+
+    Detection is prefix-based via :func:`_provider_for_model`. Anything that
+    can't be mapped (custom fine-tunes, brand-new model ids) falls back to
+    OpenAI so existing flows keep working as they did before this helper was
+    introduced.
+    """
+    pid = _provider_for_model(llm_model) or "openai"
+    meta = LLM_PROVIDER_INDEX.get(pid) or LLM_PROVIDER_INDEX["openai"]
+    agent_provider = meta.get("agent_provider") or "openai"
+    model_env_var = meta.get("model_env_var") or "OPENAI_MODEL"
+    return [
+        "-e",
+        f"AGENT_LLM_PROVIDER={agent_provider}",
+        "-e",
+        f"{model_env_var}={llm_model}",
+    ]
 
 
 def _mongo() -> MongoClient:
@@ -303,6 +621,127 @@ def _save_profiles_db(db: dict[str, Any]) -> None:
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(db, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(p)
+
+
+# ---------------------------------------------------------------------------
+# Profile attachments helpers
+#
+# Layout: every uploaded file lives at  attachments/<profile_id>/<filename>
+# (sanitized filename, with " (2)", " (3)" … suffixes appended on collision so
+# we never silently overwrite a file). Inside the profile JSON we keep a
+# `attachments` map of `display_name -> repo-relative path`. The agent already
+# bind-mounts `attachments/` read-only and exposes every file under it as an
+# available file at runtime.
+# ---------------------------------------------------------------------------
+
+# Repo-relative dir used for both on-disk storage and the path stored in profiles.
+_ATTACHMENTS_REPO_DIR = "attachments"
+
+
+def _attachments_root_local() -> Path:
+    """Filesystem path where the orchestrator reads/writes attachment files."""
+    root = REPO_ROOT / _ATTACHMENTS_REPO_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _profile_attachments_dir(profile_id: str) -> Path:
+    """Per-profile attachments dir on disk (creates it on first use)."""
+    safe_id = _safe_path_segment(profile_id)
+    if not safe_id:
+        raise ValueError("profile_id must contain at least one path-safe character")
+    d = _attachments_root_local() / safe_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _safe_path_segment(s: str) -> str:
+    """
+    Sanitize a single path segment (profile_id, filename, ...). Allows letters,
+    digits, dot, underscore, dash, and space; collapses runs of whitespace.
+    """
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"[\\/]+", "_", s)
+    s = re.sub(r"[\x00-\x1f]+", "", s)
+    s = re.sub(r"[^A-Za-z0-9._\- ()]+", "_", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.lstrip(".")
+    return s or "_"
+
+
+def _ensure_attachments_map(profile: dict[str, Any]) -> dict[str, Any]:
+    """Ensure profile['attachments'] exists as a dict; return it."""
+    att = profile.get("attachments")
+    if not isinstance(att, dict):
+        att = {}
+        profile["attachments"] = att
+    return att
+
+
+def _unique_display_name(existing: dict[str, Any], desired: str) -> str:
+    """Append ' (2)', ' (3)', … until the name is free in `existing`."""
+    base = desired.strip() or "Attachment"
+    if base not in existing:
+        return base
+    n = 2
+    while True:
+        candidate = f"{base} ({n})"
+        if candidate not in existing:
+            return candidate
+        n += 1
+
+
+def _unique_disk_filename(directory: Path, desired: str) -> str:
+    """Append ' (2)', ' (3)', … before the extension until the file is free."""
+    safe = _safe_path_segment(desired) or "file"
+    if not (directory / safe).exists():
+        return safe
+    stem, dot, ext = safe.partition(".")
+    if not dot:
+        stem, ext = safe, ""
+    n = 2
+    while True:
+        candidate = f"{stem} ({n})" + (f".{ext}" if ext else "")
+        if not (directory / candidate).exists():
+            return candidate
+        n += 1
+
+
+def _attachment_record(profile_id: str, name: str, repo_rel_path: str) -> dict[str, Any]:
+    """Build the JSON shape returned to the frontend for one attachment row."""
+    fs_path = REPO_ROOT / repo_rel_path
+    try:
+        st = fs_path.stat()
+        size = int(st.st_size)
+        mtime = float(st.st_mtime)
+    except OSError:
+        size = 0
+        mtime = 0.0
+    import mimetypes  # local import: rarely used elsewhere
+    mime, _ = mimetypes.guess_type(fs_path.name)
+    iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat() if mtime else None
+    return {
+        "name": name,
+        "filename": fs_path.name,
+        "path": repo_rel_path,
+        "size": size,
+        "mime": mime,
+        "uploaded_at": iso,
+        "exists": fs_path.is_file(),
+    }
+
+
+def _persist_profile(coll: Collection, profile_id: str, profile: dict[str, Any]) -> None:
+    """Replace the stored profile document and bump updated_at."""
+    profile["profile_id"] = profile_id
+    profile["updated_at"] = datetime.now(timezone.utc).isoformat()
+    coll.replace_one(
+        {"profile_id": profile_id},
+        {"profile_id": profile_id, "profile": profile},
+        upsert=True,
+    )
 
 
 def _ensure_custom_maps(profile: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -385,60 +824,41 @@ def update_application_record(
 ) -> dict[str, Any] | None:
     """
     Apply a shallow patch to the first matching application record (by id) and
-    rewrite the JSONL file atomically. Returns the merged record, or None if not
-    found. Unknown / protected keys are dropped by the caller.
+    persist it in Mongo. Returns the merged record, or None if not found.
+    Unknown / protected keys are dropped by the caller.
     """
-    p = _applications_path()
-    if not p.is_file():
+    try:
+        coll = _applications_coll()
+        doc = coll.find_one({"id": app_id}, {"_id": 0})
+        if not isinstance(doc, dict):
+            return None
+        merged = dict(doc)
+        merged.update(patch or {})
+        coll.update_one({"id": app_id}, {"$set": patch or {}}, upsert=False)
+        return merged
+    except PyMongoError:
         return None
-    with _applications_lock:
-        try:
-            raw_lines = p.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return None
-        updated: dict[str, Any] | None = None
-        new_lines: list[str] = []
-        for line in raw_lines:
-            s = (line or "").strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                new_lines.append(s)
-                continue
-            if isinstance(obj, dict) and obj.get("id") == app_id and updated is None:
-                obj.update(patch)
-                updated = obj
-                new_lines.append(json.dumps(obj, ensure_ascii=False))
-                continue
-            new_lines.append(json.dumps(obj, ensure_ascii=False) if isinstance(obj, dict) else s)
-        if updated is None:
-            return None
-        tmp = p.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-        tmp.replace(p)
-        return updated
 
 
 def load_state() -> dict[str, Any]:
-    p = _state_path()
-    if not p.is_file():
-        return {"machines": [], "total_applications_submitted": 0, "ledger_overrides": {}}
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and "ledger_overrides" not in data:
-            data["ledger_overrides"] = {}
-        return data if isinstance(data, dict) else {"machines": [], "total_applications_submitted": 0, "ledger_overrides": {}}
-    except (OSError, json.JSONDecodeError):
+        coll = _state_coll()
+        doc = coll.find_one({"_id": "orchestrator_state"}, {"_id": 0})
+        if not isinstance(doc, dict):
+            return {"machines": [], "total_applications_submitted": 0, "ledger_overrides": {}}
+        if "ledger_overrides" not in doc:
+            doc["ledger_overrides"] = {}
+        return doc
+    except PyMongoError:
         return {"machines": [], "total_applications_submitted": 0, "ledger_overrides": {}}
 
 
 def save_state(data: dict[str, Any]) -> None:
-    p = _state_path()
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    try:
+        coll = _state_coll()
+        coll.update_one({"_id": "orchestrator_state"}, {"$set": dict(data or {})}, upsert=True)
+    except PyMongoError:
+        return
 
 
 def _tail_lines(path: Path, *, max_lines: int = 200, max_bytes: int = 2_000_000) -> list[str]:
@@ -469,6 +889,13 @@ def _tail_lines(path: Path, *, max_lines: int = 200, max_bytes: int = 2_000_000)
 
 
 def _valid_openai_model_id(s: str) -> bool:
+    """
+    Cheap allow-list check for an LLM model id.
+
+    The name dates from when only OpenAI models were supported; the regex is
+    intentionally permissive enough to cover every provider we now plug in
+    (e.g. `deepseek-chat`, `claude-opus-4-6`, `gemini-flash-latest`, `bu-2-0`).
+    """
     s = (s or "").strip()
     if not s or len(s) > 96:
         return False
@@ -1330,6 +1757,87 @@ def patch_settings():
     return jsonify({"settings": settings})
 
 
+# ---------------------------------------------------------------------------
+# LLM provider keys (stored in MongoDB; injected into agent containers as -e flags)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/llm-providers")
+def list_llm_providers():
+    """
+    List configured LLM providers (with masked keys), plus the catalog of
+    providers the user can add. Returns:
+      {
+        "providers": [{provider, label, env_var, key_masked, key_last4, key_length,
+                       key_set, models[], spend_usd, created_at, updated_at}, ...],
+        "available": [{id, label, env_var}, ...]   # everything in the catalog
+      }
+    """
+    try:
+        providers = _list_llm_providers_public()
+    except PyMongoError as e:
+        return jsonify({"error": f"MongoDB error: {e}"}), 503
+    available = [
+        {"id": p["id"], "label": p["label"], "env_var": p["env_var"]}
+        for p in LLM_PROVIDER_REGISTRY
+    ]
+    return jsonify({"providers": providers, "available": available})
+
+
+@app.post("/api/llm-providers")
+def upsert_llm_provider():
+    """
+    Create or update a provider's API key. Body:
+      { "provider": "openai", "api_key": "sk-..." }
+    Returns the (key-redacted) public view of the saved row.
+    """
+    body = request.get_json(silent=True) or {}
+    pid = str(body.get("provider") or "").strip().lower()
+    api_key = str(body.get("api_key") or "").strip()
+    if not pid or pid not in LLM_PROVIDER_INDEX:
+        return jsonify({"error": "provider must be one of: " + ", ".join(LLM_PROVIDER_INDEX)}), 400
+    if not api_key:
+        return jsonify({"error": "api_key must be a non-empty string"}), 400
+    if len(api_key) > 1024:
+        return jsonify({"error": "api_key is unreasonably long"}), 400
+
+    now = _utc_iso()
+    try:
+        coll = _llm_providers_coll()
+        coll.update_one(
+            {"provider": pid},
+            {
+                "$set": {
+                    "provider": pid,
+                    "api_key": api_key,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+        doc = coll.find_one({"provider": pid}) or {"provider": pid, "api_key": api_key}
+    except PyMongoError as e:
+        return jsonify({"error": f"MongoDB error: {e}"}), 503
+
+    return jsonify({"provider": _serialize_llm_provider(doc)})
+
+
+@app.delete("/api/llm-providers/<provider>")
+def delete_llm_provider(provider: str):
+    """Remove a provider row (and its stored key)."""
+    pid = (provider or "").strip().lower()
+    if not pid or pid not in LLM_PROVIDER_INDEX:
+        return jsonify({"error": "unknown provider"}), 404
+    try:
+        coll = _llm_providers_coll()
+        res = coll.delete_one({"provider": pid})
+    except PyMongoError as e:
+        return jsonify({"error": f"MongoDB error: {e}"}), 503
+    if not res.deleted_count:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True, "provider": pid})
+
+
 @app.post("/api/reconcile/openai")
 def reconcile_openai_usage():
     """
@@ -1344,9 +1852,13 @@ def reconcile_openai_usage():
     end = (body.get("end") or "").strip()
     ledger_rel = (body.get("ledger_relpath") or "").strip()
 
-    admin_key = (request.headers.get("X-OpenAI-Admin-Key") or "").strip() or (os.environ.get("OPENAI_ADMIN_KEY") or "").strip()
+    admin_key = (
+        (request.headers.get("X-OpenAI-Admin-Key") or "").strip()
+        or _get_llm_provider_key("openai-admin")
+        or (os.environ.get("OPENAI_ADMIN_KEY") or "").strip()
+    )
     if not admin_key:
-        return jsonify({"error": "Missing OpenAI admin key (send X-OpenAI-Admin-Key header or set OPENAI_ADMIN_KEY)."}), 400
+        return jsonify({"error": "Missing OpenAI admin key (configure it in Settings → LLM providers, or send X-OpenAI-Admin-Key)."}), 400
     if not start or not end:
         return jsonify({"error": "Provide start and end (YYYY-MM-DD)."}), 400
 
@@ -1355,9 +1867,8 @@ def reconcile_openai_usage():
         settings = _get_settings(data)
         ledger_rel = ledger_rel or (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL)
 
-    ledger_check, _ledger_mount = _mountable_paths(ledger_rel)
-    if not ledger_check.is_file():
-        return jsonify({"error": f"Ledger not found at {ledger_check} (configure llm_ledger_relpath)."}), 400
+    # Ledger is now stored in Mongo; the reconcile script expects a JSONL file.
+    return jsonify({"error": "OpenAI reconcile expects a JSONL ledger file; ledger is stored in Mongo in this setup."}), 400
 
     env = dict(os.environ)
     env["OPENAI_ADMIN_KEY"] = admin_key
@@ -1388,7 +1899,7 @@ def reconcile_openai_usage():
 @app.get("/api/ledger")
 def get_ledger():
     """
-    Return tail of the LLM ledger (JSONL) along with any saved overrides.
+    Return recent LLM ledger rows (Mongo) along with any saved overrides.
 
     Query params:
       limit=<int> (default 200, max 2000)
@@ -1404,30 +1915,21 @@ def get_ledger():
         settings = _get_settings(data)
         ledger_rel = (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL).strip()
         overrides = data.get("ledger_overrides") if isinstance(data.get("ledger_overrides"), dict) else {}
-
-    ledger_path, _mnt = _mountable_paths(ledger_rel)
-    if not ledger_path.is_file():
-        return jsonify({"error": f"Ledger not found at {ledger_path}"}), 404
-
-    rows: list[dict[str, Any]] = []
-    for line in _tail_lines(ledger_path, max_lines=limit):
-        s = (line or "").strip()
-        if not s:
-            continue
-        try:
-            obj = json.loads(s)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        rid = str(obj.get("request_id") or obj.get("id") or "").strip()
-        ov = overrides.get(rid) if rid and isinstance(overrides, dict) else None
-        if isinstance(ov, dict):
-            obj = dict(obj)
-            obj["override"] = ov
-        rows.append(obj)
-
-    return jsonify({"ledger_relpath": ledger_rel, "rows": rows})
+    try:
+        cur = _llm_ledger_coll().find({}, {"_id": 0}).sort([("ts_unix", -1)]).limit(limit)
+        rows: list[dict[str, Any]] = []
+        for obj in cur:
+            if not isinstance(obj, dict):
+                continue
+            rid = str(obj.get("request_id") or obj.get("id") or "").strip()
+            ov = overrides.get(rid) if rid and isinstance(overrides, dict) else None
+            if isinstance(ov, dict):
+                obj = dict(obj)
+                obj["override"] = ov
+            rows.append(obj)
+        return jsonify({"ledger_relpath": ledger_rel, "rows": rows})
+    except PyMongoError:
+        return jsonify({"error": "Failed to read ledger"}), 500
 
 
 @app.patch("/api/ledger/overrides")
@@ -1579,7 +2081,6 @@ def _spawn_machine_row(
     if not _valid_openai_model_id(llm_model):
         return None, "Invalid `llm_model` (expected a safe OpenAI model id)."
 
-    env_check, env_mount = _mountable_paths(".env")
     entrypoint_mount = _host_path("agent/docker/entrypoint.sh")
     attachments_host, attachments_ctr = _attachments_bind()
 
@@ -1591,11 +2092,7 @@ def _spawn_machine_row(
         data_for_settings = load_state()
         settings = _get_settings(data_for_settings)
     pricing_overrides = settings.get("llm_pricing_overrides")
-    ledger_rel = (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL).strip()
-    ledger_host_check, ledger_host_mount = _mountable_paths(ledger_rel)
-    if ledger_rel:
-        ledger_host_check.parent.mkdir(parents=True, exist_ok=True)
-        ledger_host_check.touch(exist_ok=True)
+    llm_env_args = _llm_provider_env_args()
 
     cmd = [
         "run",
@@ -1620,18 +2117,13 @@ def _spawn_machine_row(
         f"ORCH_MACHINE_ID={mid}",
         "-e",
         "ORCH_API_BASE=http://host.docker.internal:5050",
-        "-e",
-        "AGENT_LLM_PROVIDER=openai",
-        "-e",
-        f"OPENAI_MODEL={llm_model}",
     ]
-    if ledger_rel:
-        cmd.extend(["-v", f"{ledger_host_mount}:/app/llm_ledger.jsonl"])
-        cmd.extend(["-e", "AGENT_LLM_LEDGER_PATH=/app/llm_ledger.jsonl"])
+    cmd.extend(_agent_runtime_env_for_model(llm_model))
+    # LLM ledger is stored in Mongo via the orchestrator API (no on-disk JSONL file).
+    cmd.extend(["-e", "AGENT_LLM_LEDGER_URL=http://host.docker.internal:5050/api/llm-ledger/append"])
     if isinstance(pricing_overrides, dict) and pricing_overrides:
         cmd.extend(["-e", f"AGENT_LLM_PRICING_JSON={json.dumps(pricing_overrides)}"])
-    if env_check.is_file():
-        cmd.extend(["-v", f"{env_mount}:/app/.env:ro"])
+    cmd.extend(llm_env_args)
     cmd.extend(["-v", f"{entrypoint_mount}:/usr/local/bin/agent-entrypoint.sh:ro"])
     host_log, ctr_log = _prepare_terminal_log_bind(mid, "created")
     cmd.extend(["-v", f"{host_log}:{ctr_log}"])
@@ -1848,9 +2340,9 @@ def restart_machine(mid: str):
     if not docker_available():
         return jsonify({"error": "Docker is not available"}), 503
 
-    env_check, env_mount = _mountable_paths(".env")
     entrypoint_mount = _host_path("agent/docker/entrypoint.sh")
     attachments_host, attachments_ctr = _attachments_bind()
+    llm_env_args = _llm_provider_env_args()
 
     with _state_lock:
         data = load_state()
@@ -1898,25 +2390,16 @@ def restart_machine(mid: str):
             f"ORCH_MACHINE_ID={mid}",
             "-e",
             "ORCH_API_BASE=http://host.docker.internal:5050",
-            "-e",
-            "AGENT_LLM_PROVIDER=openai",
-            "-e",
-            f"OPENAI_MODEL={llm_model}",
         ]
+        cmd.extend(_agent_runtime_env_for_model(llm_model))
         # Inject pricing overrides + ledger path (same as initial spawn).
         settings = _get_settings(data)
         pricing_overrides = settings.get("llm_pricing_overrides")
-        ledger_rel = (settings.get("llm_ledger_relpath") or DEFAULT_LLM_LEDGER_REL).strip()
-        if ledger_rel:
-            ledger_host_check, ledger_host_mount = _mountable_paths(ledger_rel)
-            ledger_host_check.parent.mkdir(parents=True, exist_ok=True)
-            ledger_host_check.touch(exist_ok=True)
-            cmd.extend(["-v", f"{ledger_host_mount}:/app/llm_ledger.jsonl"])
-            cmd.extend(["-e", "AGENT_LLM_LEDGER_PATH=/app/llm_ledger.jsonl"])
+        # LLM ledger is stored in Mongo via the orchestrator API (no on-disk JSONL file).
+        cmd.extend(["-e", "AGENT_LLM_LEDGER_URL=http://host.docker.internal:5050/api/llm-ledger/append"])
         if isinstance(pricing_overrides, dict) and pricing_overrides:
             cmd.extend(["-e", f"AGENT_LLM_PRICING_JSON={json.dumps(pricing_overrides)}"])
-        if env_check.is_file():
-            cmd.extend(["-v", f"{env_mount}:/app/.env:ro"])
+        cmd.extend(llm_env_args)
         cmd.extend(["-v", f"{entrypoint_mount}:/usr/local/bin/agent-entrypoint.sh:ro"])
         host_log, ctr_log = _prepare_terminal_log_bind(mid, "restarted")
         cmd.extend(["-v", f"{host_log}:{ctr_log}"])
@@ -2021,6 +2504,105 @@ def set_attention(mid: str):
                 save_state(data)
                 return jsonify(machine_public_view(_machine_from_dict(row), now))
         return jsonify({"error": "not found"}), 404
+
+
+def _human_input_machine_exists(mid: str) -> bool:
+    with _state_lock:
+        data = load_state()
+        return any(r.get("id") == mid for r in (data.get("machines") or []))
+
+
+@app.put("/api/machines/<mid>/human-input/requests/<rid>")
+def human_input_put_request(mid: str, rid: str):
+    """Agent registers a pending human-input card (short-poll + UI)."""
+    if not _human_input_machine_exists(mid):
+        return jsonify({"error": "not found"}), 404
+    body = request.get_json(silent=True) or {}
+    kind = str(body.get("kind") or "field").strip() or "field"
+    item = body.get("item")
+    if not isinstance(item, dict):
+        item = {}
+    coll = _human_input_coll()
+    now = time.time()
+    coll.delete_many({"machine_id": mid, "status": "pending", "_id": {"$ne": rid}})
+    doc = {
+        "_id": rid,
+        "machine_id": mid,
+        "status": "pending",
+        "created_at": now,
+        "kind": kind,
+        "item": item,
+        "response": None,
+        "answered_at": None,
+    }
+    coll.replace_one({"_id": rid}, doc, upsert=True)
+    return jsonify({"ok": True, "request_id": rid})
+
+
+@app.get("/api/machines/<mid>/human-input/requests/<rid>")
+def human_input_get_request(mid: str, rid: str):
+    """Agent polls until status becomes answered."""
+    coll = _human_input_coll()
+    cur = coll.find_one({"_id": rid})
+    if not cur or cur.get("machine_id") != mid:
+        return jsonify({"error": "not found"}), 404
+    out = {k: v for k, v in cur.items() if k != "_id"}
+    out["request_id"] = str(cur.get("_id"))
+    cr = cur.get("created_at")
+    if isinstance(cr, (int, float)) and cur.get("status") == "pending":
+        out["poll_hint_interval_s"] = _human_input_poll_hint_s(float(cr))
+    return jsonify(out)
+
+
+@app.delete("/api/machines/<mid>/human-input/requests/<rid>")
+def human_input_delete_request(mid: str, rid: str):
+    coll = _human_input_coll()
+    coll.delete_one({"_id": rid, "machine_id": mid})
+    return jsonify({"ok": True})
+
+
+@app.get("/api/machines/<mid>/human-input/current")
+def human_input_current(mid: str):
+    """UI polls for the active pending prompt for this machine."""
+    if not _human_input_machine_exists(mid):
+        return jsonify({"error": "not found"}), 404
+    coll = _human_input_coll()
+    cur = coll.find_one({"machine_id": mid, "status": "pending"}, sort=[("created_at", -1)])
+    if not cur:
+        return jsonify({"pending": False})
+    cr = cur.get("created_at")
+    ph = _human_input_poll_hint_s(float(cr)) if isinstance(cr, (int, float)) else 0.25
+    return jsonify(
+        {
+            "pending": True,
+            "request_id": str(cur.get("_id")),
+            "created_at": cr,
+            "poll_hint_interval_s": ph,
+            "kind": cur.get("kind"),
+            "item": cur.get("item") if isinstance(cur.get("item"), dict) else {},
+        }
+    )
+
+
+@app.post("/api/machines/<mid>/human-input/requests/<rid>/answer")
+def human_input_post_answer(mid: str, rid: str):
+    """Browser submits an answer for a pending request."""
+    coll = _human_input_coll()
+    cur = coll.find_one({"_id": rid})
+    if not cur or cur.get("machine_id") != mid:
+        return jsonify({"error": "not found"}), 404
+    if cur.get("status") != "pending":
+        return jsonify({"error": "not pending"}), 409
+    body = request.get_json(silent=True) or {}
+    resp: dict[str, Any] = {}
+    for k in ("value", "force_submit", "promote_to_absolute", "confirmed", "continue"):
+        if k in body:
+            resp[k] = body[k]
+    coll.update_one(
+        {"_id": rid},
+        {"$set": {"status": "answered", "response": resp, "answered_at": time.time()}},
+    )
+    return jsonify({"ok": True})
 
 
 @app.post("/api/machines/<mid>/telemetry")
@@ -2311,6 +2893,27 @@ def list_applications():
     return jsonify(read_application_records(limit=limit))
 
 
+@app.post("/api/llm-ledger/append")
+def append_llm_ledger_row():
+    """
+    Append a single LLM usage ledger row (JSON object) into Mongo.
+
+    The agent calls this endpoint when AGENT_LLM_LEDGER_URL is set.
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "expected a JSON object"}), 400
+    doc = dict(body)
+    # Add a server timestamp (seconds) for sorting even if caller omitted it.
+    if "ts_unix" not in doc:
+        doc["ts_unix"] = time.time()
+    try:
+        _llm_ledger_coll().insert_one(doc)
+        return jsonify({"ok": True})
+    except PyMongoError:
+        return jsonify({"error": "Failed to append ledger row"}), 500
+
+
 @app.get("/api/profiles")
 def list_profiles():
     """
@@ -2393,6 +2996,182 @@ def delete_profile(profile_id: str):
     except PyMongoError:
         return jsonify({"error": "Failed to write profiles store"}), 500
     return jsonify({"ok": True})
+
+
+@app.get("/api/profiles/<profile_id>/attachments")
+def list_attachments(profile_id: str):
+    """
+    List uploaded documents for a profile.
+
+    Returns: { "attachments": [ {name, filename, path, size, mime, uploaded_at, exists}, ... ] }
+    """
+    profile_id = (profile_id or "").strip()
+    if not profile_id:
+        return jsonify({"error": "profile_id required"}), 400
+    try:
+        coll = _profiles_coll()
+        doc = coll.find_one({"profile_id": profile_id}, {"profile": 1})
+        prof = doc.get("profile") if isinstance(doc, dict) else None
+        if not isinstance(prof, dict):
+            return jsonify({"error": "not found"}), 404
+        att = prof.get("attachments")
+        if not isinstance(att, dict):
+            att = {}
+        rows = [_attachment_record(profile_id, name, str(path)) for name, path in att.items() if isinstance(path, str)]
+        rows.sort(key=lambda r: (r.get("name") or "").lower())
+        return jsonify({"profile_id": profile_id, "attachments": rows})
+    except PyMongoError:
+        return jsonify({"error": "Failed to read profiles store"}), 500
+
+
+@app.post("/api/profiles/<profile_id>/attachments")
+def upload_attachment(profile_id: str):
+    """
+    Upload a new attachment for a profile.
+
+    multipart/form-data:
+      file: <required, the file>
+      name: <optional display name; defaults to filename without extension>
+
+    Behavior:
+      - Files land at  attachments/<profile_id>/<sanitized-filename>
+      - On-disk filename gets a numeric suffix on collision (never overwrite)
+      - Display name gets a numeric suffix on collision (keys must be unique)
+    """
+    profile_id = (profile_id or "").strip()
+    if not profile_id:
+        return jsonify({"error": "profile_id required"}), 400
+
+    f = request.files.get("file")
+    if f is None or not getattr(f, "filename", None):
+        return jsonify({"error": "file is required"}), 400
+
+    desired_name = (request.form.get("name") or "").strip()
+
+    try:
+        coll = _profiles_coll()
+        doc = coll.find_one({"profile_id": profile_id}, {"profile": 1})
+        prof = doc.get("profile") if isinstance(doc, dict) else None
+        if not isinstance(prof, dict):
+            return jsonify({"error": "not found"}), 404
+        prof = dict(prof)
+        att = _ensure_attachments_map(prof)
+
+        target_dir = _profile_attachments_dir(profile_id)
+        original_name = _safe_path_segment(f.filename) or "upload"
+        on_disk_name = _unique_disk_filename(target_dir, original_name)
+        target_path = target_dir / on_disk_name
+
+        # Stream-save (Werkzeug FileStorage exposes .save() but we want to be defensive
+        # about the parent dir already existing).
+        f.save(str(target_path))
+
+        # Default display name = filename without extension if user left it blank.
+        if not desired_name:
+            stem, dot, _ext = original_name.partition(".")
+            desired_name = (stem if dot else original_name) or "Attachment"
+        display_name = _unique_display_name(att, desired_name)
+
+        repo_rel = f"{_ATTACHMENTS_REPO_DIR}/{_safe_path_segment(profile_id)}/{on_disk_name}"
+        att[display_name] = repo_rel
+
+        try:
+            _persist_profile(coll, profile_id, prof)
+        except PyMongoError:
+            # Roll back the on-disk write so we don't get an orphan file.
+            try:
+                target_path.unlink()
+            except OSError:
+                pass
+            return jsonify({"error": "Failed to write profiles store"}), 500
+
+        return jsonify({
+            "ok": True,
+            "profile_id": profile_id,
+            "attachment": _attachment_record(profile_id, display_name, repo_rel),
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except OSError as e:
+        return jsonify({"error": f"Failed to save file: {e}"}), 500
+    except PyMongoError:
+        return jsonify({"error": "Failed to read profiles store"}), 500
+
+
+@app.get("/api/profiles/<profile_id>/attachments/<path:name>/download")
+def download_attachment(profile_id: str, name: str):
+    """Stream the file for `name` back to the client with a Content-Disposition."""
+    profile_id = (profile_id or "").strip()
+    name = (name or "").strip()
+    if not profile_id or not name:
+        return jsonify({"error": "profile_id and name required"}), 400
+    try:
+        coll = _profiles_coll()
+        doc = coll.find_one({"profile_id": profile_id}, {"profile": 1})
+        prof = doc.get("profile") if isinstance(doc, dict) else None
+        if not isinstance(prof, dict):
+            return jsonify({"error": "not found"}), 404
+        att = prof.get("attachments")
+        if not isinstance(att, dict) or name not in att:
+            return jsonify({"error": "attachment not found"}), 404
+        rel = str(att.get(name) or "").strip()
+    except PyMongoError:
+        return jsonify({"error": "Failed to read profiles store"}), 500
+
+    # Sanity: stored path must stay under attachments/.
+    if not rel or ".." in rel.split("/") or not rel.startswith(f"{_ATTACHMENTS_REPO_DIR}/"):
+        return jsonify({"error": "invalid attachment path"}), 500
+
+    target = (REPO_ROOT / rel).resolve()
+    try:
+        target.relative_to(_attachments_root_local().resolve())
+    except ValueError:
+        return jsonify({"error": "invalid attachment path"}), 500
+    if not target.is_file():
+        return jsonify({"error": "file missing on disk"}), 410
+
+    return send_from_directory(
+        target.parent,
+        target.name,
+        as_attachment=True,
+        download_name=target.name,
+    )
+
+
+@app.delete("/api/profiles/<profile_id>/attachments/<path:name>")
+def delete_attachment(profile_id: str, name: str):
+    """Hard-delete: remove the file from disk AND the entry from the profile JSON."""
+    profile_id = (profile_id or "").strip()
+    name = (name or "").strip()
+    if not profile_id or not name:
+        return jsonify({"error": "profile_id and name required"}), 400
+    try:
+        coll = _profiles_coll()
+        doc = coll.find_one({"profile_id": profile_id}, {"profile": 1})
+        prof = doc.get("profile") if isinstance(doc, dict) else None
+        if not isinstance(prof, dict):
+            return jsonify({"error": "not found"}), 404
+        prof = dict(prof)
+        att = _ensure_attachments_map(prof)
+        if name not in att:
+            return jsonify({"error": "attachment not found"}), 404
+        rel = str(att.pop(name) or "").strip()
+
+        # Best-effort file delete: we keep the JSON change even if the file is
+        # already gone (so the table doesn't show a phantom row).
+        if rel and rel.startswith(f"{_ATTACHMENTS_REPO_DIR}/") and ".." not in rel.split("/"):
+            target = (REPO_ROOT / rel).resolve()
+            try:
+                target.relative_to(_attachments_root_local().resolve())
+                if target.is_file():
+                    target.unlink()
+            except (ValueError, OSError):
+                pass
+
+        _persist_profile(coll, profile_id, prof)
+        return jsonify({"ok": True, "profile_id": profile_id, "name": name})
+    except PyMongoError:
+        return jsonify({"error": "Failed to write profiles store"}), 500
 
 
 @app.post("/api/profiles/<profile_id>/custom-fields")

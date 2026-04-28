@@ -1,14 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { llmKeyHeaders } from "../llmKeys.js";
 import "./ProfilesPage.css";
 
 async function fetchJson(path, options) {
-  const keyHeaders = llmKeyHeaders();
   const res = await fetch(path, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      ...keyHeaders,
       ...(options?.headers || {}),
     },
   });
@@ -42,6 +39,356 @@ function readFileAsText(file) {
     r.onerror = () => reject(new Error("Failed to read file"));
     r.readAsText(file);
   });
+}
+
+function formatBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatTimestamp(iso) {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    return d.toLocaleString();
+  } catch {
+    return "—";
+  }
+}
+
+function AttachmentsCard({ profileId, busy, onError, onProfileChanged, refreshKey }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [uploadFile, setUploadFile] = useState(null);
+  const [uploadName, setUploadName] = useState("");
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadErr, setUploadErr] = useState("");
+
+  const refresh = async () => {
+    if (!profileId) {
+      setRows([]);
+      return;
+    }
+    setLoading(true);
+    try {
+      const data = await fetchJson(`/api/profiles/${encodeURIComponent(profileId)}/attachments`);
+      setRows(Array.isArray(data?.attachments) ? data.attachments : []);
+    } catch (e) {
+      onError?.(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profileId, refreshKey]);
+
+  const openUpload = () => {
+    setUploadFile(null);
+    setUploadName("");
+    setUploadErr("");
+    setUploadOpen(true);
+  };
+
+  const submitUpload = async () => {
+    setUploadErr("");
+    if (!uploadFile) {
+      setUploadErr("Choose a file to upload.");
+      return;
+    }
+    setUploadBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", uploadFile);
+      const trimmed = (uploadName || "").trim();
+      if (trimmed) fd.append("name", trimmed);
+      const res = await fetch(`/api/profiles/${encodeURIComponent(profileId)}/attachments`, {
+        method: "POST",
+        body: fd,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setUploadErr(data?.error || res.statusText || "Upload failed");
+        return;
+      }
+      setUploadOpen(false);
+      await refresh();
+      onProfileChanged?.();
+    } catch (e) {
+      setUploadErr(e?.message || String(e));
+    } finally {
+      setUploadBusy(false);
+    }
+  };
+
+  const removeAttachment = async (name) => {
+    if (!confirm(`Delete attachment "${name}"? The file will be removed from disk.`)) return;
+    try {
+      await fetchJson(`/api/profiles/${encodeURIComponent(profileId)}/attachments/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+      });
+      await refresh();
+      onProfileChanged?.();
+    } catch (e) {
+      onError?.(e?.message || String(e));
+    }
+  };
+
+  const downloadHref = (name) =>
+    `/api/profiles/${encodeURIComponent(profileId)}/attachments/${encodeURIComponent(name)}/download`;
+
+  const filenameInputId = "attachments-upload-name";
+  const uploadModal = uploadOpen ? (
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onClick={(ev) => {
+        if (ev.target === ev.currentTarget && !uploadBusy) setUploadOpen(false);
+      }}
+    >
+      <div className="modal-dialog profiles-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h2>Upload attachment</h2>
+          <button type="button" className="modal-close" onClick={() => !uploadBusy && setUploadOpen(false)} aria-label="Close">
+            ×
+          </button>
+        </div>
+        <div className="profiles-modal-body">
+          {uploadErr ? <div className="banner danger">{uploadErr}</div> : null}
+          <label className="profiles-field">
+            <span>File</span>
+            <input
+              className="profiles-file"
+              type="file"
+              onChange={(e) => {
+                const f = e.target.files?.[0] || null;
+                setUploadFile(f);
+                if (f && !uploadName.trim()) {
+                  const stem = f.name.replace(/\.[^.]+$/, "");
+                  setUploadName(stem);
+                }
+              }}
+              disabled={uploadBusy}
+            />
+          </label>
+          <label className="profiles-field">
+            <span htmlFor={filenameInputId}>Name (shown in the table; defaults to the file name)</span>
+            <input
+              id={filenameInputId}
+              className="profiles-input"
+              type="text"
+              value={uploadName}
+              onChange={(e) => setUploadName(e.target.value)}
+              placeholder="e.g. Resume EN"
+              disabled={uploadBusy}
+            />
+          </label>
+          <div className="modal-actions">
+            <button type="button" className="btn ghost" onClick={() => setUploadOpen(false)} disabled={uploadBusy}>
+              Cancel
+            </button>
+            <button type="button" className="btn primary" onClick={submitUpload} disabled={uploadBusy || !uploadFile}>
+              {uploadBusy ? "Uploading…" : "Upload"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  return (
+    <section className="profiles-card profiles-card--wide">
+      {uploadModal}
+      <div className="profiles-card-head">
+        <div>
+          <div className="profiles-card-title">Attachments</div>
+          <div className="profiles-card-sub muted">
+            Documents stored under <span className="mono">attachments/{profileId}/</span> and made available to the agent at runtime.
+          </div>
+        </div>
+        <div className="profiles-inline-actions">
+          <button type="button" className="btn ghost btn--small" onClick={refresh} disabled={loading || busy}>
+            {loading ? "Refreshing…" : "Refresh"}
+          </button>
+          <button type="button" className="btn primary btn--small" onClick={openUpload} disabled={busy}>
+            + Upload
+          </button>
+        </div>
+      </div>
+
+      {!rows.length ? (
+        <div className="profiles-empty muted">{loading ? "Loading attachments…" : "No attachments yet."}</div>
+      ) : (
+        <div className="profiles-table profiles-attachments">
+          <div className="profiles-row profiles-row--head profiles-attachments-row">
+            <div>Name</div>
+            <div>Filename</div>
+            <div>Size</div>
+            <div>Uploaded</div>
+            <div />
+          </div>
+          {rows.map((row) => (
+            <div key={row.name} className="profiles-row profiles-attachments-row">
+              <div className="profiles-k" title={row.name}>
+                {row.name}
+              </div>
+              <div className="profiles-att-filename mono" title={row.path}>
+                {row.filename}
+                {row.exists === false ? <span className="profiles-att-warn"> (missing)</span> : null}
+              </div>
+              <div className="profiles-att-size mono">{formatBytes(row.size)}</div>
+              <div className="profiles-att-time muted">{formatTimestamp(row.uploaded_at)}</div>
+              <div className="profiles-actions">
+                <a
+                  href={downloadHref(row.name)}
+                  className="btn ghost btn--small"
+                  download={row.filename}
+                  rel="noopener"
+                >
+                  Download
+                </a>
+                <button
+                  type="button"
+                  className="btn ghost btn--small"
+                  onClick={() => removeAttachment(row.name)}
+                  title="Delete attachment"
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function JsonEditorCard({ profile, profileId, busy, refreshing, onRefresh, onProfileSaved }) {
+  const canonical = useMemo(() => (profile ? JSON.stringify(profile, null, 2) : ""), [profile]);
+  const [draft, setDraft] = useState(canonical);
+  const [parseErr, setParseErr] = useState("");
+  const [saveErr, setSaveErr] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  // Re-sync the textarea whenever the loaded profile changes (selection, refresh,
+  // post-save, or after an attachment upload). User-typed edits are intentionally
+  // overwritten on external refresh; the Reset button below also restores from
+  // canonical.
+  useEffect(() => {
+    setDraft(canonical);
+    setParseErr("");
+    setSaveErr("");
+  }, [canonical]);
+
+  const dirty = draft !== canonical;
+
+  const onChange = (e) => {
+    const v = e.target.value;
+    setDraft(v);
+    setSaveErr("");
+    if (!v.trim()) {
+      setParseErr("");
+      return;
+    }
+    try {
+      JSON.parse(v);
+      setParseErr("");
+    } catch (err) {
+      setParseErr(err?.message || "Invalid JSON");
+    }
+  };
+
+  const reset = () => {
+    setDraft(canonical);
+    setParseErr("");
+    setSaveErr("");
+  };
+
+  const save = async () => {
+    setSaveErr("");
+    let parsed;
+    try {
+      parsed = JSON.parse(draft);
+    } catch (err) {
+      setParseErr(err?.message || "Invalid JSON");
+      return;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      setSaveErr("JSON must be an object.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const data = await fetchJson(`/api/profiles/${encodeURIComponent(profileId)}`, {
+        method: "PUT",
+        body: JSON.stringify({ profile: parsed }),
+      });
+      onProfileSaved?.(data?.profile || parsed);
+    } catch (err) {
+      setSaveErr(err?.message || String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const disabled = !profile || saving;
+
+  return (
+    <section className="profiles-card profiles-card--wide">
+      <div className="profiles-card-head">
+        <div>
+          <div className="profiles-card-title">Profile JSON</div>
+          <div className="profiles-card-sub muted">
+            Edit the full profile object. Click <strong>Save</strong> to persist changes; <strong>Reset</strong> reverts the textarea to the loaded profile.
+          </div>
+        </div>
+        <div className="profiles-inline-actions">
+          <button type="button" className="btn ghost btn--small" onClick={onRefresh} disabled={busy || refreshing || saving}>
+            {refreshing ? "Refreshing…" : "Refresh"}
+          </button>
+          <button type="button" className="btn ghost btn--small" onClick={reset} disabled={!dirty || saving}>
+            Reset
+          </button>
+          <button
+            type="button"
+            className="btn primary btn--small"
+            onClick={save}
+            disabled={!dirty || !!parseErr || saving || !profile}
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+
+      {parseErr ? <div className="banner danger">JSON parse error: {parseErr}</div> : null}
+      {saveErr ? <div className="banner danger">{saveErr}</div> : null}
+      {dirty && !parseErr && !saveErr ? (
+        <div className="profiles-busy muted">Unsaved changes.</div>
+      ) : null}
+
+      <textarea
+        className="profiles-textarea mono profiles-json-editor"
+        value={draft}
+        onChange={onChange}
+        spellCheck={false}
+        disabled={disabled}
+        rows={20}
+        placeholder={profile ? "" : "Select a profile to edit JSON."}
+      />
+    </section>
+  );
 }
 
 function FieldTable({ title, scope, rows, onSet, onDelete, onPromote }) {
@@ -145,6 +492,11 @@ export function ProfilesPage() {
   const [createErr, setCreateErr] = useState("");
   const [createBusy, setCreateBusy] = useState(false);
 
+  // Bumping this counter forces the AttachmentsCard to re-fetch its rows. We
+  // bump it after the user saves the JSON editor (which can mutate the
+  // attachments map) so the table stays in sync.
+  const [attachmentsRefreshKey, setAttachmentsRefreshKey] = useState(0);
+
   const { rel, absf } = useMemo(() => getCustomMaps(profile), [profile]);
 
   const refreshList = async (keepSelection = true) => {
@@ -245,8 +597,8 @@ export function ProfilesPage() {
         label: String(createDraft.label || "").trim() || pid,
         base: {},
         other: { custom: { relative_fields: {}, absolute_fields: {} } },
+        attachments: {},
         source_pdf_path: null,
-        resume_path: null,
         created_at: nowIso,
         updated_at: nowIso,
       };
@@ -508,13 +860,25 @@ export function ProfilesPage() {
             onDelete={(key) => doCustomOp({ op: "delete", scope: "absolute", key })}
           />
 
-          <section className="profiles-card profiles-card--wide">
-            <div className="profiles-card-head">
-              <div className="profiles-card-title">Profile JSON (read-only snapshot)</div>
-              <div className="profiles-card-sub muted">This shows the full profile object currently loaded.</div>
-            </div>
-            <pre className="profiles-pre mono">{JSON.stringify(profile, null, 2)}</pre>
-          </section>
+          <AttachmentsCard
+            profileId={selected}
+            busy={busy}
+            refreshKey={attachmentsRefreshKey}
+            onError={(msg) => setErr(msg)}
+            onProfileChanged={() => loadProfile(selected)}
+          />
+
+          <JsonEditorCard
+            profile={profile}
+            profileId={selected}
+            busy={busy}
+            refreshing={loadingProfile}
+            onRefresh={() => loadProfile(selected)}
+            onProfileSaved={(p) => {
+              setProfile(p);
+              setAttachmentsRefreshKey((n) => n + 1);
+            }}
+          />
         </div>
       )}
 

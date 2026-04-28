@@ -1,0 +1,14 @@
+{
+  "machines": [],
+  "total_applications_submitted": 0,
+  "ledger_overrides": {},
+  "settings": {
+    "max_parallel_machines": 4,
+    "source_api": "",
+    "default_llm_model": "gpt-5.4-mini",
+    "budget_alert_usd": null,
+    "max_budget_per_machine_usd": 0.3,
+    "llm_pricing_overrides": null,
+    "llm_ledger_relpath": "orchestrator/data/llm_ledger.jsonl"
+  }
+}

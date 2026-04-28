@@ -41,6 +41,8 @@ import logging
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -248,6 +250,29 @@ def _default_pricing_table() -> Dict[str, ModelPricing]:
         "claude-opus-4-5": ModelPricing(usd_per_1m_input=5.00, usd_per_1m_output=25.00),
         # Google Gemini — https://ai.google.dev/gemini-api/docs/pricing
         "gemini-flash-latest": ModelPricing(usd_per_1m_input=0.10, usd_per_1m_output=0.40),
+        # DeepSeek — https://api-docs.deepseek.com/quick_start/pricing
+        # Cached-input pricing = cache hit; non-cached input = "cache miss" rate.
+        # Refresh from agent/pricing.json after each provider price change.
+        "deepseek-v4-flash": ModelPricing(
+            usd_per_1m_input=0.14,
+            usd_per_1m_output=0.28,
+            usd_per_1m_cached_input=0.028,
+        ),
+        "deepseek-v4-pro": ModelPricing(
+            usd_per_1m_input=1.74,
+            usd_per_1m_output=3.48,
+            usd_per_1m_cached_input=0.145,
+        ),
+        "deepseek-chat": ModelPricing(
+            usd_per_1m_input=0.27,
+            usd_per_1m_output=1.10,
+            usd_per_1m_cached_input=0.07,
+        ),
+        "deepseek-reasoner": ModelPricing(
+            usd_per_1m_input=0.55,
+            usd_per_1m_output=2.19,
+            usd_per_1m_cached_input=0.14,
+        ),
         # Browser-Use — https://browser-use.com/changelog
         "bu-2-0": ModelPricing(usd_per_1m_input=0.60, usd_per_1m_output=3.50),
         "bu-1-0": ModelPricing(usd_per_1m_input=0.20, usd_per_1m_output=2.00),
@@ -581,6 +606,13 @@ def extract_token_usage(obj: Any) -> Optional[TokenUsage]:
         ot = _int_or_zero(_get(usage, "output_tokens") or _get(usage, "completion_tokens"))
         tt = _int_or_zero(_get(usage, "total_tokens"))
         ci, rt, ai, ao = _extract_sub_tokens(usage)
+        # browser_use ChatInvokeUsage + DeepSeek flat usage use top-level cache fields.
+        if not ci:
+            ci = _int_or_zero(
+                _get(usage, "prompt_cached_tokens")
+                or _get(usage, "prompt_cache_hit_tokens")
+                or _get(usage, "cached_tokens")
+            )
         if it or ot or tt:
             return TokenUsage(
                 input_tokens=it,
@@ -656,6 +688,7 @@ def _extract_from_dict(d: dict) -> Optional[TokenUsage]:
         ao = _int_or_zero(cd.get("audio_tokens"))
     # Also accept top-level flat sub-fields.
     ci = ci or _int_or_zero(d.get("cached_input_tokens") or d.get("cached_tokens"))
+    ci = ci or _int_or_zero(d.get("prompt_cache_hit_tokens") or d.get("prompt_cached_tokens"))
     rt = rt or _int_or_zero(d.get("reasoning_tokens"))
     ai = ai or _int_or_zero(d.get("audio_input_tokens"))
     ao = ao or _int_or_zero(d.get("audio_output_tokens"))
@@ -684,15 +717,39 @@ def _ledger_path() -> Optional[Path]:
     return Path(p) if p else None
 
 
-def append_ledger(row: Dict[str, Any], *, path: Optional[Path] = None) -> None:
+def _ledger_url() -> Optional[str]:
+    u = (os.getenv("AGENT_LLM_LEDGER_URL") or "").strip()
+    return u or None
+
+
+def _append_ledger_http(row: Dict[str, Any], *, url: str, timeout_s: float = 2.0) -> None:
+    data = json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310 - internal URL
+        # Drain the response to keep urllib happy; ignore body.
+        _ = resp.read()
+
+
+def append_ledger(row: Dict[str, Any], *, path: Optional[Path] = None, url: Optional[str] = None) -> None:
     """
-    Append a single JSONL row to the ledger. Safe under concurrent threads;
-    multi-process callers should run behind an OS-level lock if needed.
+    Append a single ledger row.
+
+    When ``AGENT_LLM_LEDGER_URL`` is set, posts the row to that endpoint.
+    Otherwise, when ``AGENT_LLM_LEDGER_PATH`` is set, appends JSONL locally.
     """
-    p = path or _ledger_path()
-    if p is None:
-        return
     try:
+        u = url or _ledger_url()
+        if u:
+            _append_ledger_http(row, url=u)
+            return
+        p = path or _ledger_path()
+        if p is None:
+            return
         p.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
         with _LEDGER_LOCK:
@@ -732,6 +789,7 @@ class LLMUsageRecorder:
     def __init__(self, *, ledger_path: Optional[str | Path] = None) -> None:
         self._by_key: Dict[Tuple[str, str, str], _Slot] = {}
         self._ledger_path: Optional[Path] = Path(ledger_path) if ledger_path else _ledger_path()
+        self._ledger_url: Optional[str] = _ledger_url()
         self._lock = threading.Lock()
 
     # --- aggregation ------------------------------------------------------
@@ -770,7 +828,7 @@ class LLMUsageRecorder:
             slot.usage.add(usage.normalized())
             slot.calls += 1
 
-        if ledger_meta is not None and self._ledger_path is not None:
+        if ledger_meta is not None and (self._ledger_url is not None or self._ledger_path is not None):
             cost = estimate_cost_usd(model=model, usage=usage, tier=tier)
             row: Dict[str, Any] = {
                 "ts": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -781,7 +839,7 @@ class LLMUsageRecorder:
                 "cost_usd": None if cost is None else round(float(cost), 8),
             }
             row.update({k: v for k, v in ledger_meta.items() if k not in row})
-            append_ledger(row, path=self._ledger_path)
+            append_ledger(row, path=self._ledger_path, url=self._ledger_url)
 
     def record_call(
         self,
