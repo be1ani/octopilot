@@ -23,7 +23,7 @@ export function ReviewSubmitDialog({ record, onClose, onSubmitted, onRemoveMachi
     setJobCompany(record?.job_company || "");
     setJobCity(record?.job_city || "");
     setDescription(record?.description || "");
-  }, [record?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [record?.id, record?.job_title, record?.job_company, record?.job_city, record?.application_url, record?.screenshot_count]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const onKey = (e) => {

@@ -35,6 +35,10 @@ def coerce_base_full_name_to_string(applicant_obj: dict[str, Any]) -> None:
     """
     Forms sometimes map first/last name separately; mistaken deep-sets can store
     base.full_name as {"first_name": ..., "last_name": ...}. Coerce to a single string.
+
+    Also merges legacy flat ``base.first_name`` / ``base.last_name`` (not part of the
+    typed Profile model) into ``base.full_name`` and removes those keys so
+    ``Profile.model_validate`` does not fail with extra="forbid" on BaseInfo.
     """
     profiles = applicant_obj.get("profiles")
     if not isinstance(profiles, dict):
@@ -51,6 +55,18 @@ def coerce_base_full_name_to_string(applicant_obj: dict[str, Any]) -> None:
             last = str(fn.get("last_name") or "").strip()
             merged = f"{first} {last}".strip() or "Unknown"
             base["full_name"] = merged
+
+        s_first = str(base.get("first_name") or "").strip()
+        s_last = str(base.get("last_name") or "").strip()
+        if s_first or s_last:
+            merged = f"{s_first} {s_last}".strip()
+            cur = base.get("full_name")
+            if isinstance(cur, str) and cur.strip() and cur.strip() != "Unknown":
+                base["full_name"] = merged or cur.strip()
+            else:
+                base["full_name"] = merged or "Unknown"
+            base.pop("first_name", None)
+            base.pop("last_name", None)
 
 
 def normalize_base_address(applicant_obj: dict[str, Any]) -> None:
@@ -230,6 +246,8 @@ class OrchestratorProfileStore:
         # model declares extra="forbid", so any stale field would otherwise trip
         # validation).
         strip_legacy_top_level_fields({"profiles": {profile_id: prof}})
+        coerce_base_full_name_to_string({"profiles": {profile_id: prof}})
+        normalize_base_address({"profiles": {profile_id: prof}})
         return Profile.model_validate(prof)
 
     def upsert_profile(self, profile: Profile) -> None:

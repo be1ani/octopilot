@@ -27,6 +27,8 @@ RUN apt-get update \
     tmux \
     x11vnc \
     x11-utils \
+    xclip \
+    xdotool \
     xvfb \
   && rm -rf /var/lib/apt/lists/*
 

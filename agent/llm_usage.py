@@ -50,6 +50,75 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
+_USER_GUIDANCE_REL = "user_guidance.txt"
+
+
+def _operator_guidance_text(control: Any) -> str:
+    """Return trimmed text from ``user_guidance.txt`` next to ``state.json``, if any."""
+    try:
+        sp = getattr(control, "state_path", None)
+        if sp is None:
+            return ""
+        path = Path(sp).parent / _USER_GUIDANCE_REL
+        if not path.is_file():
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _system_guidance_message(text: str) -> Any:
+    """
+    Build a system message object compatible with the LLM stack in use.
+
+    browser-use passes ``browser_use.llm.messages.*`` (Pydantic models), not
+    LangChain's ``langchain_core.messages`` — LangChain ``SystemMessage`` instances
+    fail ``isinstance`` checks and break serializers, so guidance was never applied.
+    """
+    try:
+        from browser_use.llm.messages import SystemMessage as BU_SystemMessage
+
+        return BU_SystemMessage(content=text)
+    except Exception:
+        pass
+    try:
+        from langchain_core.messages import SystemMessage as LC_SystemMessage
+
+        return LC_SystemMessage(content=text)
+    except Exception:
+        return None
+
+
+def _looks_like_llm_message_list(msgs: Any) -> bool:
+    if not isinstance(msgs, list) or not msgs:
+        return False
+    first = msgs[0]
+    return hasattr(first, "role") and hasattr(first, "content")
+
+
+def _inject_operator_guidance_messages(
+    args: Tuple[Any, ...], kwargs: Dict[str, Any], body: str
+) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+    """Prepend a system message to the chat history passed into the model."""
+    if not body:
+        return args, kwargs
+    prefix = (
+        "Operator guidance (orchestrator UI). Prefer following this unless it conflicts "
+        "with safety or policy:\n\n"
+    )
+    msg = _system_guidance_message(prefix + body)
+    if msg is None:
+        return args, kwargs
+    kw = dict(kwargs)
+    m = kw.get("messages")
+    if isinstance(m, list) and m and _looks_like_llm_message_list(m):
+        kw["messages"] = [msg, *m]
+        return args, kw
+    if args and isinstance(args[0], list) and args[0] and _looks_like_llm_message_list(args[0]):
+        new_first = [msg, *args[0]]
+        return (new_first,) + args[1:], kw
+    return args, kw
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -952,6 +1021,15 @@ class TokenTrackingLLM:
         self._recorder = recorder
         self._tier = tier
 
+    def _apply_operator_guidance(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        ctl = self._control()
+        if ctl is None or not getattr(ctl, "enabled", False):
+            return args, kwargs
+        txt = _operator_guidance_text(ctl)
+        if not txt:
+            return args, kwargs
+        return _inject_operator_guidance_messages(args, kwargs, txt)
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._llm, name)
 
@@ -967,6 +1045,7 @@ class TokenTrackingLLM:
         ctl = self._control()
         if ctl is not None:
             await ctl.gate_async()
+        args, kwargs = self._apply_operator_guidance(args, kwargs)
         res = await self._llm.ainvoke(*args, **kwargs)
         self._recorder.record_call(
             provider=self._provider,
@@ -981,6 +1060,7 @@ class TokenTrackingLLM:
         ctl = self._control()
         if ctl is not None:
             ctl.gate()
+        args, kwargs = self._apply_operator_guidance(args, kwargs)
         res = self._llm.invoke(*args, **kwargs)
         self._recorder.record_call(
             provider=self._provider,
@@ -997,6 +1077,7 @@ class TokenTrackingLLM:
             ctl = self._control()
             if ctl is not None:
                 await ctl.gate_async()
+            args, kwargs = self._apply_operator_guidance(args, kwargs)
             res = await fn(*args, **kwargs)
             self._recorder.record_call(
                 provider=self._provider,

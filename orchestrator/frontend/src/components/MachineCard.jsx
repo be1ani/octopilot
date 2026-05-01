@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   FiCheckCircle,
+  FiClipboard,
   FiFileText,
   FiLock,
   FiMoreVertical,
@@ -8,12 +9,15 @@ import {
   FiPlay,
   FiRefreshCcw,
   FiSquare,
+  FiStopCircle,
   FiTrash2,
   FiUnlock,
+  FiVolume2,
+  FiVolumeX,
   FiX,
 } from "react-icons/fi";
 import { ReviewSubmitDialog } from "./ReviewSubmitDialog.jsx";
-import { HumanInputPanel } from "./HumanInputPanel.jsx";
+import { HumanInputPanel, readAttentionSoundMuted, writeAttentionSoundMuted } from "./HumanInputPanel.jsx";
 import "./MachineCard.css";
 
 const HIDDEN_IMAGE_LABELS = new Set(["", "latest", "LATEST", "Latest"]);
@@ -106,6 +110,7 @@ export function MachineCard({
     status,
     image_label: imageLabel,
     llm_model: llmModel,
+    profile_id: applicantProfileId,
     needs_human: needsHuman,
     needs_human_reason: needsHumanReason,
     uptime_label: uptimeLabel,
@@ -166,9 +171,16 @@ export function MachineCard({
 
   const urgentAudioRef = useRef(null);
   const [urgentSoundBlocked, setUrgentSoundBlocked] = useState(false);
+  const [attentionSoundMuted, setAttentionSoundMuted] = useState(() => readAttentionSoundMuted());
 
   useEffect(() => {
-    if (!budgetExceeded || budgetAck) {
+    const onMute = () => setAttentionSoundMuted(readAttentionSoundMuted());
+    window.addEventListener("octopilot-attention-sound-mute-changed", onMute);
+    return () => window.removeEventListener("octopilot-attention-sound-mute-changed", onMute);
+  }, []);
+
+  useEffect(() => {
+    if (!budgetExceeded || budgetAck || attentionSoundMuted) {
       setUrgentSoundBlocked(false);
       if (urgentAudioRef.current) {
         urgentAudioRef.current.pause();
@@ -196,12 +208,12 @@ export function MachineCard({
 
     if (!urgentSoundBlocked) return;
     const onUserGesture = () => {
-      if (!budgetExceeded || budgetAck) return;
+      if (!budgetExceeded || budgetAck || attentionSoundMuted) return;
       tryPlay();
     };
     window.addEventListener("pointerdown", onUserGesture, { once: true });
     return () => window.removeEventListener("pointerdown", onUserGesture);
-  }, [budgetExceeded, budgetAck, urgentSoundBlocked]);
+  }, [budgetExceeded, budgetAck, urgentSoundBlocked, attentionSoundMuted]);
 
   const showFrames = status === "running" && desktopUrl && terminalUrl && desktopReady && terminalReady;
 
@@ -299,6 +311,13 @@ export function MachineCard({
   const [logsTruncated, setLogsTruncated] = useState(false);
   const [logsTotalBytes, setLogsTotalBytes] = useState(0);
   const [pauseBusy, setPauseBusy] = useState(false);
+  const [pasteBusy, setPasteBusy] = useState(false);
+  const [pasteErr, setPasteErr] = useState(null);
+  const [stopAgentBusy, setStopAgentBusy] = useState(false);
+  const [guidanceText, setGuidanceText] = useState("");
+  const [guidanceBusy, setGuidanceBusy] = useState(false);
+  const [guidanceErr, setGuidanceErr] = useState(null);
+  const [guidanceSaved, setGuidanceSaved] = useState(false);
   const [budgetBusy, setBudgetBusy] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef(null);
@@ -353,12 +372,13 @@ export function MachineCard({
       }
     };
     load();
-    const t = setInterval(load, 5000);
+    const intervalMs = reviewOpen ? 2000 : 5000;
+    const t = setInterval(load, intervalMs);
     return () => {
       cancelled = true;
       clearInterval(t);
     };
-  }, [status, id]);
+  }, [status, id, reviewOpen]);
 
   const submitDisabled = !latestApp;
   const submitTitle = latestApp
@@ -384,6 +404,50 @@ export function MachineCard({
     }
   }, [id]);
 
+  const pasteFromHostClipboard = useCallback(async () => {
+    if (!showFrames) return;
+    setPasteErr(null);
+    setPasteBusy(true);
+    try {
+      const text = await navigator.clipboard.readText();
+      const res = await fetch(`/api/machines/${id}/desktop-paste`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j.error || res.statusText || "Paste failed");
+    } catch (e) {
+      setPasteErr(
+        e?.message ||
+          "Clipboard or paste failed. Use a secure context (HTTPS), allow clipboard access, and focus a field in the desktop before pasting."
+      );
+    } finally {
+      setPasteBusy(false);
+    }
+  }, [id, showFrames]);
+
+  const saveGuidance = useCallback(async () => {
+    setGuidanceBusy(true);
+    setGuidanceErr(null);
+    setGuidanceSaved(false);
+    try {
+      const res = await fetch(`/api/machines/${id}/user-guidance`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: guidanceText }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j.error || res.statusText || "Save failed");
+      setGuidanceSaved(true);
+      window.setTimeout(() => setGuidanceSaved(false), 2200);
+    } catch (e) {
+      setGuidanceErr(e?.message || "Save failed");
+    } finally {
+      setGuidanceBusy(false);
+    }
+  }, [id, guidanceText]);
+
   useEffect(() => {
     if (!logsOpen) return undefined;
     loadLogs();
@@ -400,6 +464,29 @@ export function MachineCard({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [logsOpen]);
+
+  useEffect(() => {
+    if (bottomPanel !== "guidance" || status !== "running") return undefined;
+    let cancelled = false;
+    setGuidanceErr(null);
+    (async () => {
+      try {
+        const res = await fetch(`/api/machines/${id}/user-guidance`);
+        const j = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          setGuidanceErr(j.error || res.statusText || "Failed to load guidance");
+          return;
+        }
+        setGuidanceText(typeof j.text === "string" ? j.text : "");
+      } catch (e) {
+        if (!cancelled) setGuidanceErr(e?.message || "Failed to load guidance");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [bottomPanel, id, status]);
 
   const showBudgetOverlay = budgetExceeded && !budgetAck;
   const showAttention = needsHuman && !(budgetExceeded && budgetAck);
@@ -424,13 +511,33 @@ export function MachineCard({
                 {llmModel}
               </span>
             ) : null}
-            {needsHuman ? (
+            {applicantProfileId ? (
               <span
-                className="attention-pill"
-                title={needsHumanReason ? `Needs human: ${needsHumanReason}` : "Needs human intervention"}
+                className="machine-version-pill machine-profile-pill"
+                title={`Applicant profile: ${applicantProfileId}`}
               >
-                HUMAN
+                {applicantProfileId}
               </span>
+            ) : null}
+            {needsHuman ? (
+              <>
+                <span
+                  className="attention-pill"
+                  title={needsHumanReason ? `Needs human: ${needsHumanReason}` : "Needs human intervention"}
+                >
+                  HUMAN
+                </span>
+                <button
+                  type="button"
+                  className="attention-mute-btn"
+                  onClick={() => writeAttentionSoundMuted(!readAttentionSoundMuted())}
+                  title={attentionSoundMuted ? "Unmute human-needed alerts" : "Mute human-needed alert sounds"}
+                  aria-label={attentionSoundMuted ? "Unmute alert sounds" : "Mute alert sounds"}
+                  aria-pressed={attentionSoundMuted}
+                >
+                  {attentionSoundMuted ? <FiVolumeX aria-hidden /> : <FiVolume2 aria-hidden />}
+                </button>
+              </>
             ) : null}
             {agentPaused ? (
               <span
@@ -589,6 +696,39 @@ export function MachineCard({
       <div className="machine-card-body">
         <div className="desktop-stack">
           <div className="desktop-frame" style={{ width: vw }}>
+            {showFrames ? (
+              <div className="desktop-toolbar">
+                <button
+                  type="button"
+                  className="desktop-toolbar-btn"
+                  onClick={() => pasteFromHostClipboard()}
+                  disabled={pasteBusy}
+                  title="Paste from this browser's clipboard into the focused window on the agent desktop (Ctrl+V)"
+                >
+                  <FiClipboard aria-hidden />
+                  <span>{pasteBusy ? "Pasting…" : "Paste"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="desktop-toolbar-btn"
+                  disabled={!canPauseAgent || stopAgentBusy || takeoverInProgress || agentPaused}
+                  onClick={async () => {
+                    if (!onAgentPause || !canPauseAgent) return;
+                    setStopAgentBusy(true);
+                    try {
+                      await onAgentPause(id, true);
+                    } finally {
+                      setStopAgentBusy(false);
+                    }
+                  }}
+                  title="Stop the automation agent. VNC and the container keep running; resume the agent from the ⋮ menu."
+                >
+                  <FiStopCircle aria-hidden />
+                  <span>{stopAgentBusy ? "Stopping…" : "Stop agent"}</span>
+                </button>
+                {pasteErr ? <span className="desktop-toolbar-err">{pasteErr}</span> : null}
+              </div>
+            ) : null}
             {desktopUrl ? (
               <a
                 className="desktop-open"
@@ -678,6 +818,15 @@ export function MachineCard({
               >
                 Input
               </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={bottomPanel === "guidance"}
+                className={`machine-bottom-tab${bottomPanel === "guidance" ? " machine-bottom-tab--active" : ""}`}
+                onClick={() => setBottomPanel("guidance")}
+              >
+                Guidance
+              </button>
             </div>
             {bottomPanel === "terminal" ? (
               <div
@@ -703,15 +852,54 @@ export function MachineCard({
                   </div>
                 )}
               </div>
-            ) : (
+            ) : bottomPanel === "input" ? (
               <div
                 className="iframe-shell terminal-shell machine-human-input-shell"
                 style={{ width: vw, height: TERMINAL_HEIGHT }}
               >
                 {showFrames ? (
-                  <HumanInputPanel machineId={id} pollActive={showFrames && bottomPanel === "input"} />
+                  <HumanInputPanel
+                    machineId={id}
+                    profileId={applicantProfileId || ""}
+                    pollActive={showFrames && bottomPanel === "input"}
+                  />
                 ) : (
                   <div className="iframe-placeholder">Input unavailable</div>
+                )}
+              </div>
+            ) : (
+              <div
+                className="iframe-shell terminal-shell machine-guidance-shell"
+                style={{ width: vw, height: TERMINAL_HEIGHT }}
+              >
+                {status === "running" ? (
+                  <div className="machine-guidance-panel">
+                    <p className="machine-guidance-lead">
+                      Text here is injected into the agent before each LLM step (while the run is active). Use it for
+                      one-off corrections, site-specific rules, or reminders.
+                    </p>
+                    {guidanceErr ? <div className="machine-guidance-err">{guidanceErr}</div> : null}
+                    <textarea
+                      className="machine-guidance-textarea"
+                      value={guidanceText}
+                      onChange={(e) => setGuidanceText(e.target.value)}
+                      spellCheck
+                      placeholder="e.g. Prefer PDF upload for the CV field; the site rejects .docx."
+                    />
+                    <div className="machine-guidance-actions">
+                      <button
+                        type="button"
+                        className="btn primary btn--small"
+                        disabled={guidanceBusy}
+                        onClick={() => saveGuidance()}
+                      >
+                        {guidanceBusy ? "Saving…" : "Save guidance"}
+                      </button>
+                      {guidanceSaved ? <span className="machine-guidance-saved">Saved</span> : null}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="iframe-placeholder">Guidance is available while the machine is running.</div>
                 )}
               </div>
             )}

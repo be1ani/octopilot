@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -81,6 +82,10 @@ class Machine:
     # reported yet.
     agent_state: str | None = None
     agent_state_at: float | None = None
+    # Optional job metadata (from job board / API) for placeholders and human review.
+    job_title: str | None = None
+    job_company: str | None = None
+    job_city: str | None = None
 
 
 def _state_path() -> Path:
@@ -116,6 +121,7 @@ def _terminal_log_rel(mid: str) -> str:
 
 CONTROL_DIR_REL_TMPL = "orchestrator/data/control/{mid}"
 CONTROL_FILE_NAME = "state.json"
+USER_GUIDANCE_FILE = "user_guidance.txt"
 CONTROL_MOUNT_PATH = "/var/run/okto-control"
 
 
@@ -927,6 +933,9 @@ def _machine_from_dict(d: dict[str, Any]) -> Machine:
         agent_paused=bool(d.get("agent_paused") or False),
         agent_state=(d.get("agent_state") or None),
         agent_state_at=d.get("agent_state_at"),
+        job_title=(d.get("job_title") or "").strip() or None,
+        job_company=(d.get("job_company") or "").strip() or None,
+        job_city=(d.get("job_city") or "").strip() or None,
     )
 
 
@@ -1535,10 +1544,16 @@ def _queue_dispatch_tick() -> None:
                 it["id"], {"status": "error", "error": "job has no url / apply_url"}, base=base
             )
             continue
+        job_title = (job.get("title") or "").strip()
+        job_company = (job.get("company") or "").strip()
+        job_city = (job.get("city") or "").strip()
         row, err = _spawn_machine_row(
             url=url,
             profile_id=(it.get("profile_id") or DEFAULT_PROFILE),
             llm_model=default_llm_model,
+            job_title=job_title,
+            job_company=job_company,
+            job_city=job_city,
         )
         if err and (row is None or row.get("status") == "error"):
             _src_patch_queue(
@@ -2065,6 +2080,9 @@ def _spawn_machine_row(
     profile_id: str,
     image: str | None = None,
     llm_model: str | None = None,
+    job_title: str | None = None,
+    job_company: str | None = None,
+    job_city: str | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """
     Core docker spawn logic shared by the HTTP endpoint and the queue dispatcher.
@@ -2080,6 +2098,9 @@ def _spawn_machine_row(
     llm_model = (llm_model or DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
     if not _valid_openai_model_id(llm_model):
         return None, "Invalid `llm_model` (expected a safe OpenAI model id)."
+    jt = (job_title or "").strip()
+    jc = (job_company or "").strip()
+    jcity = (job_city or "").strip()
 
     entrypoint_mount = _host_path("agent/docker/entrypoint.sh")
     attachments_host, attachments_ctr = _attachments_bind()
@@ -2160,6 +2181,9 @@ def _spawn_machine_row(
                 "job_url": url,
                 "profile_id": profile_id,
                 "llm_model": llm_model,
+                "job_title": jt,
+                "job_company": jc,
+                "job_city": jcity,
                 "status": "error",
                 "error": err[:2000],
                 "container_id": None,
@@ -2183,6 +2207,9 @@ def _spawn_machine_row(
             "job_url": url,
             "profile_id": profile_id,
             "llm_model": llm_model,
+            "job_title": jt,
+            "job_company": jc,
+            "job_city": jcity,
             "image": image,
             "status": "starting",
             "error": None,
@@ -2235,9 +2262,9 @@ def _spawn_machine_row(
                 "created_at": now,
                 "created_at_iso": _utc_iso(now),
                 "application_url": url,
-                "job_title": "",
-                "job_company": "",
-                "job_city": "",
+                "job_title": jt,
+                "job_company": jc,
+                "job_city": jcity,
                 "profile_id": profile_id,
                 "llm_model": llm_model,
                 "status": "In progress",
@@ -2268,6 +2295,9 @@ def create_machine():
     profile_id = (body.get("profile_id") or DEFAULT_PROFILE).strip()
     image = (body.get("image") or DEFAULT_IMAGE).strip()
     llm_model = (body.get("llm_model") or "").strip() or DEFAULT_OPENAI_MODEL
+    job_title = (body.get("job_title") or "").strip()
+    job_company = (body.get("job_company") or "").strip()
+    job_city = (body.get("job_city") or "").strip()
 
     ensure_background_sync()
     with _state_lock:
@@ -2287,6 +2317,9 @@ def create_machine():
         profile_id=profile_id,
         image=image,
         llm_model=llm_model,
+        job_title=job_title,
+        job_company=job_company,
+        job_city=job_city,
     )
     if err and (row is None or row.get("status") == "error"):
         payload: dict[str, Any] = {"error": err}
@@ -2754,6 +2787,105 @@ def set_agent_takeover(mid: str):
         return jsonify(machine_public_view(_machine_from_dict(row), time.time()))
 
 
+def _control_dir_check_path(mid: str) -> Path:
+    check, _host = _mountable_paths(_control_dir_rel(mid))
+    return check
+
+
+@app.get("/api/machines/<mid>/user-guidance")
+def get_user_guidance(mid: str):
+    """Return operator-authored guidance text synced into the agent control directory."""
+    with _state_lock:
+        data = load_state()
+        if not any(r.get("id") == mid for r in (data.get("machines") or [])):
+            return jsonify({"error": "not found"}), 404
+    p = _control_dir_check_path(mid) / USER_GUIDANCE_FILE
+    try:
+        if not p.is_file():
+            return jsonify({"text": ""})
+        return jsonify({"text": p.read_text(encoding="utf-8", errors="replace")})
+    except OSError as exc:
+        return jsonify({"error": f"failed to read guidance: {exc}"}), 500
+
+
+@app.put("/api/machines/<mid>/user-guidance")
+def put_user_guidance(mid: str):
+    """Write guidance the agent reads before each LLM call (see agent/llm_usage.py)."""
+    body = request.get_json(silent=True) or {}
+    text = body.get("text", "")
+    if text is None:
+        text = ""
+    if not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
+    if len(text) > 50_000:
+        return jsonify({"error": "text too long (max 50000 chars)"}), 400
+    with _state_lock:
+        data = load_state()
+        if not any(r.get("id") == mid for r in (data.get("machines") or [])):
+            return jsonify({"error": "not found"}), 404
+    base = _control_dir_check_path(mid)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        (base / USER_GUIDANCE_FILE).write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return jsonify({"error": f"failed to write guidance: {exc}"}), 500
+    return jsonify({"ok": True})
+
+
+@app.post("/api/machines/<mid>/desktop-paste")
+def desktop_paste_from_host(mid: str):
+    """
+    Copy JSON ``text`` into the machine's X11 clipboard and synthesize Ctrl+V
+    so the focused window receives the host-provided string (e.g. from the
+    orchestrator browser clipboard).
+    """
+    body = request.get_json(silent=True) or {}
+    text = body.get("text")
+    if not isinstance(text, str):
+        return jsonify({"error": "text must be a string"}), 400
+    if len(text) > 512_000:
+        return jsonify({"error": "text too long"}), 400
+    if not docker_available():
+        return jsonify({"error": "Docker is not available"}), 503
+    with _state_lock:
+        data = load_state()
+        row = next((r for r in (data.get("machines") or []) if r.get("id") == mid), None)
+    if not row:
+        return jsonify({"error": "not found"}), 404
+    if row.get("status") != "running":
+        return jsonify({"error": "machine is not running"}), 400
+    cid = row.get("container_id")
+    if not cid:
+        return jsonify({"error": "no container"}), 400
+    if inspect_running(str(cid)) is not True:
+        return jsonify({"error": "container is not running"}), 400
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as tf:
+        tf.write(text)
+        host_tmp = tf.name
+    try:
+        r = _docker(["cp", host_tmp, f"{cid}:/tmp/okto-orch-paste.txt"], timeout=30.0)
+        if r.returncode != 0:
+            err = ((r.stderr or "") + (r.stdout or "")).strip() or "docker cp failed"
+            return jsonify({"error": err[:2000]}), 500
+        inner = (
+            "export DISPLAY=:99; "
+            "xclip -selection clipboard < /tmp/okto-orch-paste.txt && "
+            "xdotool key ctrl+v; "
+            "rm -f /tmp/okto-orch-paste.txt"
+        )
+        r2 = _docker(["exec", str(cid), "bash", "-lc", inner], timeout=30.0)
+        if r2.returncode != 0:
+            err = ((r2.stderr or "") + (r2.stdout or "")).strip() or "paste exec failed"
+            return jsonify({"error": err[:2000]}), 500
+    finally:
+        try:
+            os.unlink(host_tmp)
+        except OSError:
+            pass
+    return jsonify({"ok": True})
+
+
 def _read_control_state(mid: str) -> str:
     """Best-effort reader for the current control state ('running' default)."""
     check, _host = _mountable_paths(_control_dir_rel(mid))
@@ -2817,7 +2949,7 @@ def latest_application_for_machine(mid: str):
     # Scan up to 2000 recent records; machines are usually short-lived.
     for r in read_application_records(limit=2000):
         if r.get("machine_id") == mid:
-            return jsonify(r)
+            return jsonify(_enrich_application_record_dict(r))
     return jsonify(None)
 
 
@@ -2875,7 +3007,7 @@ def patch_application(app_id: str):
     updated = update_application_record(app_id, patch)
     if updated is None:
         return jsonify({"error": "application not found"}), 404
-    return jsonify(updated)
+    return jsonify(_enrich_application_record_dict(updated))
 
 
 @app.get("/api/applications")
@@ -2890,7 +3022,8 @@ def list_applications():
     except Exception:
         limit = 200
     limit = max(1, min(limit, 2000))
-    return jsonify(read_application_records(limit=limit))
+    rows = read_application_records(limit=limit)
+    return jsonify([_enrich_application_record_dict(x) for x in rows])
 
 
 @app.post("/api/llm-ledger/append")
@@ -3294,6 +3427,22 @@ def _list_run_shots(run_id: str) -> list[dict[str, Any]]:
     return shots
 
 
+def _enrich_application_record_dict(record: dict[str, Any]) -> dict[str, Any]:
+    """
+    Attach on-disk step screenshots when `run_id` is set. Placeholder records are
+    updated with `run_id` on first screenshot POST so the review dialog can show
+    progress before the agent posts a final application-result.
+    """
+    if not isinstance(record, dict):
+        return record
+    out = dict(record)
+    rid = str(out.get("run_id") or "").strip()
+    if rid and _RUN_ID_RE.match(rid):
+        out["screenshots"] = _list_run_shots(rid)
+        out["screenshot_count"] = len(out["screenshots"])
+    return out
+
+
 @app.post("/api/machines/<mid>/screenshot")
 def log_step_screenshot(mid: str):
     """
@@ -3356,6 +3505,25 @@ def log_step_screenshot(mid: str):
             fh.write(json.dumps(meta_entry, ensure_ascii=False) + "\n")
     except Exception:
         # Metadata is best-effort; the png is still usable.
+        pass
+    try:
+        coll = _applications_coll()
+        cur = coll.find(
+            {
+                "machine_id": mid,
+                "status": "In progress",
+                "$or": [
+                    {"run_id": {"$exists": False}},
+                    {"run_id": None},
+                    {"run_id": ""},
+                ],
+            },
+            {"id": 1},
+        ).sort("ts", -1).limit(1)
+        doc = next(cur, None)
+        if isinstance(doc, dict) and doc.get("id"):
+            coll.update_one({"id": doc["id"]}, {"$set": {"run_id": run_id}})
+    except PyMongoError:
         pass
     return jsonify({"ok": True, "bytes": len(payload), "index": step_index}), 201
 
@@ -3441,12 +3609,21 @@ def log_application_result(mid: str):
     profile_id = _pick_machine_str("profile_id")
     llm_model = _pick_machine_str("llm_model")
     application_url = (body.get("application_url") or "").strip()
+    if not application_url and machine_row:
+        application_url = (machine_row.get("job_url") or "").strip()
 
     # Enrich with source-api metadata so the applications page can show
     # human-friendly title/company/city instead of a raw URL.
     job_title = (body.get("job_title") or "").strip()
     job_company = (body.get("job_company") or "").strip()
     job_city = (body.get("job_city") or "").strip()
+    if machine_row:
+        if not job_title:
+            job_title = (machine_row.get("job_title") or "").strip()
+        if not job_company:
+            job_company = (machine_row.get("job_company") or "").strip()
+        if not job_city:
+            job_city = (machine_row.get("job_city") or "").strip()
     if application_url and (not job_title or not job_company):
         try:
             data_for_settings = load_state()

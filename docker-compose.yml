@@ -25,9 +25,9 @@ services:
       ORCH_HOST_REPO_ROOT: "/home/oligarch/Projects/octopilot"
       # Use the host docker CLI mounted below
       ORCH_DOCKER_BIN: "/host-bin/docker"
-      # External source API the orchestrator polls for queued work.
-      # Leave blank to disable queue polling until configured at runtime.
-      SOURCE_API: ""
+      # Job board HTTP API: pending queue items are polled and dispatched here
+      # (respecting max parallel machines). Each item carries a profile_id for the agent.
+      SOURCE_API: "http://job-board:5060"
       # Default parallel-machine limit; live-editable from the UI.
       ORCH_MAX_PARALLEL_MACHINES: "4"
     depends_on:

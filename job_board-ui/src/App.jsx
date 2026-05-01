@@ -525,7 +525,7 @@ export default function App() {
   }
 
   async function onEnqueue(job, profileIdOverride) {
-    const profile_id = profileIdOverride || selectedProfile;
+    const profile_id = String(profileIdOverride || selectedProfile || "main").trim() || "main";
     setBusy(true);
     try {
       await jobBoardApi.createQueueItem({
@@ -553,7 +553,10 @@ export default function App() {
     try {
       const machine = await orchApi.enqueue({
         url: applyUrl,
-        profile_id: item.profile_id || selectedProfile
+        profile_id: String(item.profile_id || selectedProfile || "main").trim() || "main",
+        job_title: (job.title && String(job.title).trim()) || "",
+        job_company: (job.company && String(job.company).trim()) || "",
+        job_city: (job.city && String(job.city).trim()) || ""
       });
       await jobBoardApi.updateQueueItem(item.id, {
         status: "in_progress",

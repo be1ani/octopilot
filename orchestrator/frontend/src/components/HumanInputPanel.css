@@ -168,3 +168,13 @@ textarea.human-input-control {
   background: rgba(14, 116, 144, 0.35);
   color: #e0f2fe;
 }
+
+.hi-password-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.hi-select {
+  cursor: pointer;
+}

@@ -1,6 +1,45 @@
 import { useCallback, useEffect, useState } from "react";
 import "./HumanInputPanel.css";
 
+const ATTENTION_MUTE_LS = "octopilot.muteAttentionSound";
+
+export function readAttentionSoundMuted() {
+  try {
+    return localStorage.getItem(ATTENTION_MUTE_LS) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function writeAttentionSoundMuted(muted) {
+  try {
+    localStorage.setItem(ATTENTION_MUTE_LS, muted ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+  try {
+    window.dispatchEvent(new CustomEvent("octopilot-attention-sound-mute-changed"));
+  } catch {
+    /* ignore */
+  }
+}
+
+function repoPathToContainerPath(repoRel) {
+  const s = String(repoRel || "").replace(/^\//, "");
+  if (!s) return "";
+  if (s.startsWith("attachments/")) return `/${s}`;
+  return `/attachments/${s.replace(/^attachments\/?/i, "")}`;
+}
+
+function generatePassword(len = 20) {
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&*-_=+";
+  const arr = new Uint32Array(len);
+  crypto.getRandomValues(arr);
+  let out = "";
+  for (let i = 0; i < len; i++) out += alphabet[arr[i] % alphabet.length];
+  return out;
+}
+
 function softValidate(item, val, force) {
   if (force) return null;
   const v = item?.validation;
@@ -28,7 +67,7 @@ function softValidate(item, val, force) {
   return null;
 }
 
-export function HumanInputPanel({ machineId, pollActive }) {
+export function HumanInputPanel({ machineId, profileId, pollActive }) {
   const [cur, setCur] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -38,6 +77,10 @@ export function HumanInputPanel({ machineId, pollActive }) {
   const [boolVal, setBoolVal] = useState(null);
   const [promote, setPromote] = useState(false);
   const [clientErr, setClientErr] = useState(null);
+  const [showPassword, setShowPassword] = useState(false);
+  const [attachmentOptions, setAttachmentOptions] = useState([]);
+  const [attachmentsErr, setAttachmentsErr] = useState(null);
+  const [attachmentsLoading, setAttachmentsLoading] = useState(false);
 
   const poll = useCallback(async () => {
     try {
@@ -72,6 +115,7 @@ export function HumanInputPanel({ machineId, pollActive }) {
       setBoolVal(null);
       setPromote(false);
       setClientErr(null);
+      setShowPassword(false);
       return;
     }
     const item = cur.item;
@@ -99,7 +143,51 @@ export function HumanInputPanel({ machineId, pollActive }) {
     }
     setPromote(false);
     setClientErr(null);
+    setShowPassword(false);
   }, [cur?.request_id, cur?.pending]);
+
+  useEffect(() => {
+    if (!profileId || !pollActive || !cur?.pending || cur?.item?.value_kind !== "file_path") {
+      setAttachmentOptions([]);
+      setAttachmentsErr(null);
+      setAttachmentsLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setAttachmentsLoading(true);
+    (async () => {
+      try {
+        const res = await fetch(`/api/profiles/${encodeURIComponent(profileId)}/attachments`);
+        const j = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          setAttachmentsErr(j.error || res.statusText || "failed to load files");
+          setAttachmentOptions([]);
+          return;
+        }
+        setAttachmentsErr(null);
+        const rows = Array.isArray(j.attachments) ? j.attachments : [];
+        setAttachmentOptions(
+          rows
+            .filter((r) => r && r.exists !== false && r.path)
+            .map((r) => ({
+              label: `${r.name || r.filename || "file"} (${r.filename || ""})`,
+              path: repoPathToContainerPath(r.path),
+            }))
+        );
+      } catch (e) {
+        if (!cancelled) {
+          setAttachmentsErr(e?.message || "failed to load files");
+          setAttachmentOptions([]);
+        }
+      } finally {
+        if (!cancelled) setAttachmentsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [profileId, pollActive, cur?.request_id, cur?.item?.value_kind]);
 
   const postAnswer = async (body) => {
     if (!cur?.pending || !cur?.request_id) return;
@@ -238,22 +326,87 @@ export function HumanInputPanel({ machineId, pollActive }) {
             onChange={(e) => setLocalVal(e.target.value)}
             autoComplete="off"
           />
+          {item.sensitive ? (
+            <div className="hi-password-actions">
+              <button type="button" className="btn ghost btn--small" onClick={() => setLocalVal(generatePassword())}>
+                Generate random password
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
-      {isField && ["text", "file_path", "number", "date"].includes(vk) ? (
+      {isField && vk === "file_path" ? (
+        <div className="human-input-field">
+          <label htmlFor={`hi-fp-${cur.request_id}`}>{item.display_name || "File"}</label>
+          {profileId ? (
+            attachmentsLoading ? (
+              <div className="human-input-meta">Loading profile files…</div>
+            ) : attachmentOptions.length > 0 ? (
+              <select
+                id={`hi-fp-${cur.request_id}`}
+                className="human-input-control hi-select"
+                value={attachmentOptions.some((o) => o.path === localVal) ? localVal : ""}
+                onChange={(e) => setLocalVal(e.target.value)}
+              >
+                <option value="">— Select a file —</option>
+                {attachmentOptions.map((o) => (
+                  <option key={o.path} value={o.path}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <>
+                <div className="human-input-err">
+                  {attachmentsErr || "No files in this profile. Add attachments on the Profiles page, or enter a path."}
+                </div>
+                <input
+                  id={`hi-fp-${cur.request_id}`}
+                  className="human-input-control"
+                  type="text"
+                  value={localVal}
+                  onChange={(e) => setLocalVal(e.target.value)}
+                  placeholder="/attachments/…"
+                />
+              </>
+            )
+          ) : (
+            <input
+              id={`hi-fp-${cur.request_id}`}
+              className="human-input-control"
+              type="text"
+              value={localVal}
+              onChange={(e) => setLocalVal(e.target.value)}
+              placeholder="Path inside the machine (e.g. /attachments/…)"
+            />
+          )}
+        </div>
+      ) : null}
+
+      {isField && ["text", "number", "date"].includes(vk) ? (
         <div className="human-input-field">
           <label htmlFor={`hi-${cur.request_id}`}>{item.display_name || "Value"}</label>
           <input
             id={`hi-${cur.request_id}`}
             className="human-input-control"
             type={
-              item.sensitive ? "password" : vk === "number" ? "number" : vk === "date" ? "date" : "text"
+              item.sensitive && !showPassword ? "password" : vk === "number" ? "number" : vk === "date" ? "date" : "text"
             }
             value={localVal}
             onChange={(e) => setLocalVal(e.target.value)}
             autoComplete={item.sensitive ? "new-password" : "on"}
           />
+          {item.sensitive ? (
+            <div className="hi-password-actions">
+              <button type="button" className="btn ghost btn--small" onClick={() => setShowPassword((v) => !v)}>
+                {showPassword ? "Hide password" : "Show password"}
+              </button>
+              <button type="button" className="btn ghost btn--small" onClick={() => setLocalVal(generatePassword())}>
+                Generate random password
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
 

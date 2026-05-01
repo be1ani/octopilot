@@ -915,6 +915,8 @@ def _build_task(job_url: str, profile: dict[str, Any]) -> str:
         "- CRITICAL: Never fill a field without a clear rationale grounded in the applicant profile or explicit instructions on the page.\n"
         "- Before clicking any button that submits an application, advances to the next step, "
         "or performs any irreversible action, you MUST call `confirm_before_submit` and wait for user approval.\n"
+        "  This applies to **every** step of a multi-page flow (e.g. German \"Weiter\", \"Next\", \"Continue\") — not only the final send button. "
+        "After each `confirm_before_submit` returns, click that button and keep filling until there is nothing left to do.\n"
         "- CRITICAL — `done` vs `confirm_before_submit`:\n"
         "  - `done` TERMINATES the run. It must be called ONLY after the application has actually been submitted\n"
         "    (or after a hard stop you cannot recover from). NEVER use `done` to pause for user approval,\n"
@@ -1703,10 +1705,12 @@ async def _run(
         Policy:
           - If `confirm_before_submit` has already been called this run, allow
             `done` through (agent is reporting the final outcome).
-          - Otherwise, if `done` is called with `success=False` OR the text
-            looks like "needs confirmation / please confirm / ready to submit",
-            reject it: return a non-terminating ActionResult with an error that
-            tells the agent to call `confirm_before_submit` instead.
+          - Otherwise, if the text looks like a pause for approval / wrong tool
+            (see `looks_like_pause`), reject: return a non-terminating ActionResult
+            that tells the agent to call `confirm_before_submit` and continue.
+          - When no relative fields were used, still allow only `done(success=True)`
+            without `confirm_before_submit`; `done(success=False)` must not bypass
+            the pause detector (that was terminating \"need confirm before Weiter\" runs).
           - After `_DONE_GUARD_MAX_REJECTIONS` rejections in a row, stop
             fighting the model and let `done` through (fail-safe so we never
             get stuck in an infinite rejection loop).
@@ -1735,7 +1739,17 @@ async def _run(
             "please confirm",
             "awaiting confirmation",
             "confirmation before",
+            "confirm_before_submit",
+            "need to call confirm",
+            "must call confirm",
             "bewerbung senden",  # the German submit-button text from the failing run
+        )
+        _PAUSE_FAILURE_PHRASES = (
+            "confirm_before_submit",
+            "not done",
+            "not finished",
+            "premature",
+            "incomplete",
         )
 
         async def guarded_done(**kwargs: Any) -> Any:
@@ -1743,9 +1757,11 @@ async def _run(
             success = bool(getattr(params, "success", False))
             text = str(getattr(params, "text", "") or "")
             text_l = text.lower()
-            looks_like_pause = (
-                not success
-                or any(h in text_l for h in _CONFIRMATION_HINTS)
+            # Do not treat every success=False as a pause — genuine hard stops
+            # (e.g. site error) should still be able to end the run without going
+            # through confirm. Pause-for-approval is detected by phrasing.
+            looks_like_pause = any(h in text_l for h in _CONFIRMATION_HINTS) or (
+                not success and any(p in text_l for p in _PAUSE_FAILURE_PHRASES)
             )
 
             # Already confirmed submission at least once → allow the agent to
@@ -1753,10 +1769,12 @@ async def _run(
             if done_guard_state["confirm_called"]:
                 return await original_fn(**kwargs)
 
-            # If nothing in the task required confirmation (no relative fields),
-            # don't obstruct `done` either — submissions are auto in that case.
+            # No relative-field review: auto path still must not let the model
+            # terminate with done(success=False, "…confirm before Weiter…").
+            # Successful completion may skip the confirm gate (confirm auto-approves).
             if not getattr(profiler, "relative_used_in_current_form", True):
-                return await original_fn(**kwargs)
+                if success:
+                    return await original_fn(**kwargs)
 
             # Fail-safe: if we've rejected too many times, stop obstructing so
             # the run can still terminate.

@@ -24,6 +24,94 @@
   font-size: 0.8rem;
 }
 
+.apps-stats {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.35);
+  padding: 0.75rem 0.85rem 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.apps-stats-head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+}
+
+.apps-stats-title {
+  font-weight: 800;
+  font-size: 0.9rem;
+  letter-spacing: -0.02em;
+}
+
+.apps-stats-sub {
+  font-size: 0.72rem;
+}
+
+.apps-stat-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+}
+
+@media (max-width: 640px) {
+  .apps-stat-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+.apps-stat-card {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.25);
+  padding: 0.5rem 0.6rem;
+}
+
+.apps-stat-label {
+  font-size: 0.68rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.apps-stat-value {
+  margin-top: 0.15rem;
+  font-size: 1.45rem;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: rgba(241, 245, 249, 0.98);
+  font-variant-numeric: tabular-nums;
+}
+
+.apps-stats-footnote {
+  margin: 0;
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.apps-chart-wrap {
+  margin-top: 0.15rem;
+  width: 100%;
+  max-width: 640px;
+  align-self: center;
+}
+
+.apps-chart-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 180px;
+}
+
+.apps-chart-caption {
+  text-align: center;
+  font-size: 0.7rem;
+  margin-top: -0.15rem;
+}
+
 .apps-empty {
   padding: 1.2rem 0.2rem;
 }
@@ -192,6 +280,28 @@
   background: rgba(148, 163, 184, 0.1);
   border-color: rgba(148, 163, 184, 0.25);
   color: rgba(226, 232, 240, 0.9);
+}
+
+.app-status--submitted {
+  background: rgba(96, 165, 250, 0.14);
+  border-color: rgba(96, 165, 250, 0.38);
+  color: #dbeafe;
+}
+
+.apps-status-cell {
+  display: flex;
+  align-items: center;
+}
+
+.apps-status-select {
+  max-width: 100%;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.22rem 0.4rem;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.92);
+  color: var(--text);
 }
 
 .apps-row--open {

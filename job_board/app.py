@@ -212,6 +212,8 @@ def create_app() -> Flask:
         body = request.get_json(silent=True) or {}
         job_id = (body.get("job_id") or "").strip()
         profile_id = (body.get("profile_id") or "").strip()
+        if not profile_id:
+            profile_id = (os.environ.get("JOB_BOARD_DEFAULT_PROFILE_ID") or "main").strip()
         try:
             priority = int(body.get("priority", 0) or 0)
         except (TypeError, ValueError):

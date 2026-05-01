@@ -5,6 +5,7 @@ import { ApplicationsPage } from "./components/ApplicationsPage.jsx";
 import { SettingsPage } from "./components/SettingsPage.jsx";
 import { ProfilesPage } from "./components/ProfilesPage.jsx";
 import { ToastHost } from "./components/ToastHost.jsx";
+import { readAttentionSoundMuted, writeAttentionSoundMuted } from "./components/HumanInputPanel.jsx";
 import "./App.css";
 
 const SIDEBAR_KEY = "octopilot.sidebarMinimized";
@@ -48,7 +49,14 @@ export default function App() {
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [soundBlocked, setSoundBlocked] = useState(false);
+  const [attentionSoundMuted, setAttentionSoundMuted] = useState(() => readAttentionSoundMuted());
   const audioRef = useRef(null);
+
+  useEffect(() => {
+    const onMute = () => setAttentionSoundMuted(readAttentionSoundMuted());
+    window.addEventListener("octopilot-attention-sound-mute-changed", onMute);
+    return () => window.removeEventListener("octopilot-attention-sound-mute-changed", onMute);
+  }, []);
 
   const outOfFundsMachines = useMemo(
     () =>
@@ -137,7 +145,7 @@ export default function App() {
 
   useEffect(() => {
     // Loop the warning sound while any machine needs human intervention.
-    if (!attentionNeeded) {
+    if (!attentionNeeded || attentionSoundMuted) {
       setSoundBlocked(false);
       if (audioRef.current) {
         audioRef.current.pause();
@@ -168,12 +176,12 @@ export default function App() {
     if (!soundBlocked) return;
 
     const onUserGesture = () => {
-      if (!attentionNeeded) return;
+      if (!attentionNeeded || attentionSoundMuted) return;
       tryPlay();
     };
     window.addEventListener("pointerdown", onUserGesture, { once: true });
     return () => window.removeEventListener("pointerdown", onUserGesture);
-  }, [attentionNeeded, soundBlocked]);
+  }, [attentionNeeded, soundBlocked, attentionSoundMuted]);
 
   const ignoreOutOfFunds = useCallback(async () => {
     // Clear attention state for all affected machines (this also silences sound + hides banner).
@@ -309,9 +317,29 @@ export default function App() {
         settings={settings}
         onUpdateSettings={updateSettings}
       />
-      {attentionNeeded && soundBlocked ? (
-        <div className="banner warn" style={{ margin: "0.6rem 1rem 0" }}>
-          <strong>Human intervention needed.</strong> Click anywhere to enable the alert sound.
+      {attentionNeeded ? (
+        <div
+          className="banner warn"
+          style={{
+            margin: "0.6rem 1rem 0",
+            display: "flex",
+            gap: "0.75rem",
+            alignItems: "center",
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={{ flex: "1 1 12rem" }}>
+            <strong>Human intervention needed.</strong>
+            {soundBlocked && !attentionSoundMuted ? " Click anywhere to enable the alert sound." : null}
+            {attentionSoundMuted ? " Alert sounds are muted." : null}
+          </div>
+          <button
+            type="button"
+            className="btn ghost btn--small"
+            onClick={() => writeAttentionSoundMuted(!readAttentionSoundMuted())}
+          >
+            {attentionSoundMuted ? "Unmute sounds" : "Mute sounds"}
+          </button>
         </div>
       ) : null}
       <main className="main">

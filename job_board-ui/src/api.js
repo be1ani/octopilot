@@ -51,10 +51,10 @@ export const jobBoardApi = {
 
 export const orchApi = {
   listProfiles: () => fetchJson(`/orch-api/api/profiles`),
-  enqueue: ({ url, profile_id }) =>
+  enqueue: ({ url, profile_id, job_title, job_company, job_city }) =>
     fetchJson("/orch-api/api/machines", {
       method: "POST",
-      body: JSON.stringify({ url, profile_id })
+      body: JSON.stringify({ url, profile_id, job_title, job_company, job_city })
     }),
   getSettings: () => fetchJson("/orch-api/api/settings"),
   updateSettings: (patch) =>
