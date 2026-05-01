@@ -8,7 +8,7 @@
 
 OctoPilot spins up isolated, disposable Dockerized agents that drive real Chromium browsers to complete web tasks on your behalf. Each agent is a full Linux desktop you can *watch live* in the browser, *pause* mid-thought, or *take over* when the LLM gets stuck. Dispatch dozens of agents from a single dashboard, share structured profiles between them, and keep a running ledger of LLM spend — all from one place.
 
-![OctoPilot dashboard with multiple parallel browser agents running](docs/screenshots/hero-dashboard.png)
+![OctoPilot dashboard with multiple parallel browser agents running](docs/screenshots/dashboard.gif)
 *The main dashboard: several agent "machines" running in parallel, each tile embeds a live noVNC view of the agent's desktop and a web terminal. The left sidebar shows aggregate health, budget, and a "Start job" launcher.*
 
 ---
@@ -90,7 +90,6 @@ When an agent can't make progress on its own (out of funds, hit a CAPTCHA, ambig
 - A looping alert sound (`urgent.wav` for per-machine budget issues, `bipbop.wav` for general attention).
 - A top-of-page banner when the browser blocks the sound until the user interacts.
 
-![Attention-needed state on a machine tile](docs/screenshots/attention-needed.png)
 *An agent has paused itself for human input. The tile is outlined in amber, the side panel shows the reason ("form field ambiguous"), and the "Takeover" button hands the desktop to the user.*
 
 ### Profiles — structured data the agents share
@@ -102,7 +101,7 @@ Import a PDF (typically a resume), and OctoPilot runs it through an LLM to produ
 - Custom fields the agent can add on the fly when it hits an unrecognized question — you review and approve them later.
 - **Attachments** — per-profile documents (resumes, cover letters, transcripts…) uploaded straight from the Profiles page. Each file is stored under `attachments/<profile_id>/` and recorded inside the profile JSON as a `{ display_name: relative_path }` map. The agent container bind-mounts `attachments/` read-only and exposes every file in the profile's `attachments` group as an available file to the LLM.
 
-![Profiles page with PDF import and field editor](docs/screenshots/profiles-page.png)
+
 *The Profiles page: left — list of stored profiles with PDF import button; right — the structured field editor with absolute vs relative categories, custom fields added by agents highlighted for review.*
 
 ### LLM ledger and budget guardrails
@@ -131,7 +130,6 @@ When a machine exceeds its budget or the provider returns "insufficient quota", 
 
 When an agent finishes a task it can post a structured result. The **Applications** page shows a sortable table of everything submitted so far, with screenshots, the profile used, cost, and status.
 
-![Applications tracker page](docs/screenshots/applications-page.png)
 *The Applications tracker: each row is one completed task, with the target URL, profile used, final screenshot, token cost, and a "View run" link that restores the screenshot carousel for that agent.*
 
 ### Screenshot carousel per run
